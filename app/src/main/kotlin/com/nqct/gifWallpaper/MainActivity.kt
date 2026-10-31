@@ -1,149 +1,237 @@
 package com.nqct.gifWallpaper
 
-import android.app.Activity
-import android.content.ComponentName
 import android.content.Context
-import android.content.Intent
-import android.os.Bundle
-import android.view.Gravity
-import android.view.ViewGroup
-import android.widget.*
+import android.graphics.*
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.service.wallpaper.WallpaperService
+import android.view.SurfaceHolder
 import java.io.File
-import java.io.FileOutputStream
 
-class MainActivity : Activity() {
+class GifWallpaperService : WallpaperService() {
+    override fun onCreateEngine(): Engine = GifEngine()
 
-    private lateinit var tvGif1: TextView
-    private lateinit var tvGif2: TextView
-    private lateinit var etMinTime: EditText
-    private lateinit var etMaxTime: EditText
+    inner class GifEngine : Engine() {
 
-    // 修复：不能在这里直接 File(filesDir, ...)，必须用 lateinit 延迟初始化
-    private lateinit var fileGif1: File
-    private lateinit var fileGif2: File
+        private val handler = Handler(Looper.getMainLooper())
 
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        
-        // 修复：在 onCreate 里初始化，此时上下文已就绪，不会闪退
-        fileGif1 = File(filesDir, "gif1.gif")
-        fileGif2 = File(filesDir, "gif2.gif")
+        @Volatile private var visible = false
+        @Volatile private var destroyed = false
+        @Volatile private var ready = false
 
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(50, 50, 50, 50) 
-            gravity = Gravity.CENTER_HORIZONTAL
-        }
+        private var movie1: Movie? = null
+        private var movie2: Movie? = null
+        private var info1: GifInfo? = null
+        private var info2: GifInfo? = null
 
-        // --- 1. 选择 GIF 1 ---
-        val btnSelect1 = Button(this).apply {
-            text = "选择主 GIF (待机)"
-            setOnClickListener { selectGif(1) }
-        }
-        tvGif1 = TextView(this).apply {
-            text = if (fileGif1.exists()) "已设置: ${fileGif1.length() / 1024} KB" else "未设置"
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 30)
-        }
-        layout.addView(btnSelect1, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        layout.addView(tvGif1, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        private var isPlayingSecond = false
 
-        // --- 2. 选择 GIF 2 ---
-        val btnSelect2 = Button(this).apply {
-            text = "选择随机触发的 GIF (副)"
-            setOnClickListener { selectGif(2) }
-        }
-        tvGif2 = TextView(this).apply {
-            text = if (fileGif2.exists()) "已设置: ${fileGif2.length() / 1024} KB" else "未设置"
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 50)
-        }
-        layout.addView(btnSelect2, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        layout.addView(tvGif2, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        /** 全部使用 elapsedRealtime 基准 */
+        private var currentMovieStartTime = 0L
+        private var nextTriggerTime = 0L
+        private var pausedAt = 0L
 
-        // --- 3. 随机时间设置 ---
-        val tvTimeTitle = TextView(this).apply { text = "随机触发间隔设置 (单位: 秒)"; textSize = 18f; setPadding(0, 0, 0, 20) }
-        layout.addView(tvTimeTitle)
+        private var minIntervalMs = 15_000L
+        private var maxIntervalMs = 45_000L
 
-        val timeLayout = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
-        etMinTime = EditText(this).apply { hint = "最小间隔(如10)"; setText("15") }
-        etMaxTime = EditText(this).apply { hint = "最大间隔(如30)"; setText("45") }
-        timeLayout.addView(etMinTime, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        timeLayout.addView(etMaxTime, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        layout.addView(timeLayout)
+        private var loaderThread: Thread? = null
 
-        val btnSave = Button(this).apply {
-            text = "保存参数"
-            setOnClickListener {
-                saveSettings()
-                Toast.makeText(this@MainActivity, "参数已保存！", Toast.LENGTH_SHORT).show()
+        private val drawRunnable = object : Runnable {
+            override fun run() {
+                if (destroyed || !visible || !ready) return
+                val nextDelay = drawFrame()
+                if (destroyed || !visible) return
+                handler.postDelayed(this, nextDelay)
             }
         }
-        layout.addView(btnSave, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        // --- 4. 去设置壁纸 ---
-        val btnSetWallpaper = Button(this).apply {
-            text = "去应用动态壁纸"
-            setOnClickListener {
-                saveSettings()
-                val intent = Intent(android.app.WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
-                    putExtra(
-                        android.app.WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT,
-                        ComponentName(this@MainActivity, GifWallpaperService::class.java)
-                    )
+        override fun onSurfaceCreated(holder: SurfaceHolder) {
+            super.onSurfaceCreated(holder)
+            loadInBackground()
+        }
+
+        private fun loadInBackground() {
+            loaderThread?.interrupt()
+            loaderThread = Thread {
+                try {
+                    val prefs = getSharedPreferences("PetPrefs", Context.MODE_PRIVATE)
+                    var minSec = prefs.getInt("minTime", 15)
+                    var maxSec = prefs.getInt("maxTime", 45)
+                    if (minSec <= 0) minSec = 1
+                    if (maxSec <= 0) maxSec = 1
+                    if (minSec > maxSec) {
+                        val t = minSec; minSec = maxSec; maxSec = t
+                    }
+
+                    val file1 = File(filesDir, "gif1.gif")
+                    val file2 = File(filesDir, "gif2.gif")
+
+                    val m1 = if (file1.exists()) Movie.decodeFile(file1.absolutePath) else null
+                    val m2 = if (file2.exists()) Movie.decodeFile(file2.absolutePath) else null
+                    val i1 = GifMetadataParser.parse(file1)
+                    val i2 = GifMetadataParser.parse(file2)
+
+                    handler.post {
+                        if (destroyed) return@post
+                        minIntervalMs = minSec * 1000L
+                        maxIntervalMs = maxSec * 1000L
+                        movie1 = m1
+                        movie2 = m2
+                        info1 = i1
+                        info2 = i2
+
+                        isPlayingSecond = false
+                        val now = SystemClock.elapsedRealtime()
+                        currentMovieStartTime = now
+                        pausedAt = 0L
+                        scheduleNextTrigger(now)
+
+                        ready = true
+                        if (visible) {
+                            handler.removeCallbacks(drawRunnable)
+                            handler.post(drawRunnable)
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
                 }
-                startActivity(intent)
+            }.also { it.start() }
+        }
+
+        private fun scheduleNextTrigger(now: Long) {
+            val lo = minIntervalMs.coerceAtLeast(1_000L)
+            val hi = maxIntervalMs.coerceAtLeast(lo)
+            nextTriggerTime = now + if (hi > lo) (lo..hi).random() else lo
+        }
+
+        override fun onVisibilityChanged(visible: Boolean) {
+            this.visible = visible
+            if (visible) {
+                val now = SystemClock.elapsedRealtime()
+                if (pausedAt > 0L) {
+                    val delta = now - pausedAt
+                    if (currentMovieStartTime > 0L) currentMovieStartTime += delta
+                    if (nextTriggerTime > 0L) nextTriggerTime += delta
+                    pausedAt = 0L
+                }
+                if (ready) {
+                    handler.removeCallbacks(drawRunnable)
+                    handler.post(drawRunnable)
+                }
+            } else {
+                pausedAt = SystemClock.elapsedRealtime()
+                handler.removeCallbacks(drawRunnable)
             }
         }
-        layout.addView(btnSetWallpaper, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        setContentView(layout)
-        loadSettings()
-    }
-
-    private fun selectGif(type: Int) {
-        val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            setType("image/gif")
+        override fun onSurfaceRedrawNeeded(holder: SurfaceHolder) {
+            super.onSurfaceRedrawNeeded(holder)
+            if (ready && visible && !destroyed) {
+                drawFrame()
+            }
         }
-        startActivityForResult(intent, type)
-    }
 
-    @Deprecated("Deprecated in Java")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (resultCode == RESULT_OK && data?.data != null) {
-            val uri = data.data!!
-            val targetFile = if (requestCode == 1) fileGif1 else fileGif2
-            
+        override fun onSurfaceDestroyed(holder: SurfaceHolder) {
+            super.onSurfaceDestroyed(holder)
+            destroyed = true
+            visible = false
+            ready = false
+            handler.removeCallbacks(drawRunnable)
+            loaderThread?.interrupt()
+            loaderThread = null
+            movie1 = null
+            movie2 = null
+            info1 = null
+            info2 = null
+        }
+
+        /** @return 距离下一次重绘的延迟（毫秒） */
+        private fun drawFrame(): Long {
+            val holder = surfaceHolder
+
+            // 一次性捕获到局部 val：解决 smart cast，且保证同帧一致快照
+            val m1 = movie1
+            val m2 = movie2
+            val i1 = info1
+            val i2 = info2
+
+            var canvas: Canvas? = null
             try {
-                contentResolver.openInputStream(uri)?.use { input ->
-                    FileOutputStream(targetFile).use { output ->
-                        input.copyTo(output)
+                canvas = holder.lockCanvas() ?: return defaultInterval()
+                canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+
+                val now = SystemClock.elapsedRealtime()
+
+                // 1. 触发副 GIF
+                if (!isPlayingSecond && m2 != null &&
+                    nextTriggerTime > 0L && now >= nextTriggerTime) {
+                    isPlayingSecond = true
+                    currentMovieStartTime = now
+                }
+
+                // 2. 副 GIF 播放结束 → 回到主 GIF
+                if (isPlayingSecond && m2 != null) {
+                    val d = resolveDuration(m2, i2)
+                    if (d > 0 && now - currentMovieStartTime >= d) {
+                        isPlayingSecond = false
+                        currentMovieStartTime = now
+                        scheduleNextTrigger(now)
                     }
                 }
-                if (requestCode == 1) {
-                    tvGif1.text = "已设置: ${targetFile.length() / 1024} KB"
-                } else {
-                    tvGif2.text = "已设置: ${targetFile.length() / 1024} KB"
-                }
+
+                val movie: Movie? = if (isPlayingSecond) m2 else m1
+                val info: GifInfo? = if (isPlayingSecond) i2 else i1
+
+                if (movie == null) return defaultInterval()
+
+                val duration = resolveDuration(movie, info)
+                val elapsed = (now - currentMovieStartTime).coerceAtLeast(0L)
+
+                val time = if (duration > 0) (elapsed % duration).toInt() else 0
+                movie.setTime(time)
+
+                drawMovieCentered(canvas, movie)
+
+                return info?.frameIntervalMs(duration) ?: defaultInterval()
             } catch (e: Exception) {
-                Toast.makeText(this, "复制失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                e.printStackTrace()
+                return defaultInterval()
+            } finally {
+                canvas?.let {
+                    try {
+                        holder.unlockCanvasAndPost(it)
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
             }
         }
-    }
 
-    private fun saveSettings() {
-        val prefs = getSharedPreferences("PetPrefs", Context.MODE_PRIVATE)
-        prefs.edit()
-            .putInt("minTime", etMinTime.text.toString().toIntOrNull() ?: 15)
-            .putInt("maxTime", etMaxTime.text.toString().toIntOrNull() ?: 45)
-            .apply()
-    }
+        private fun resolveDuration(movie: Movie, info: GifInfo?): Int {
+            val d = movie.duration()
+            if (d > 0) return d
+            return info?.totalDelayMs ?: 0
+        }
 
-    private fun loadSettings() {
-        val prefs = getSharedPreferences("PetPrefs", Context.MODE_PRIVATE)
-        etMinTime.setText(prefs.getInt("minTime", 15).toString())
-        etMaxTime.setText(prefs.getInt("maxTime", 45).toString())
+        private fun defaultInterval(): Long = GifInfo.DEFAULT_FRAME_INTERVAL_MS
+
+        private fun drawMovieCentered(canvas: Canvas, movie: Movie) {
+            val screenW = canvas.width
+            val screenH = canvas.height
+            val movieW = movie.width().toFloat()
+            val movieH = movie.height().toFloat()
+
+            if (movieW <= 0f || movieH <= 0f) return
+
+            val scale = minOf(screenW / movieW, screenH / movieH)
+
+            canvas.save()
+            canvas.translate(screenW / 2f, screenH / 2f)
+            canvas.scale(scale, scale)
+            canvas.translate(-movieW / 2f, -movieH / 2f)
+            movie.draw(canvas, 0f, 0f)
+            canvas.restore()
+        }
     }
 }
