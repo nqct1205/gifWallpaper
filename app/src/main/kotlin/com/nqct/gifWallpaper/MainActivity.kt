@@ -8,6 +8,7 @@ import android.graphics.Color
 import android.os.Bundle
 import android.view.Gravity
 import android.view.ViewGroup
+import android.view.Window
 import android.widget.*
 import java.io.File
 import java.io.FileOutputStream
@@ -19,13 +20,15 @@ class MainActivity : Activity() {
     private lateinit var tvGif2: TextView
     private lateinit var tvInfo1: TextView
     private lateinit var tvInfo2: TextView
-    private lateinit var etMinTime: EditText
-    private lateinit var etMaxTime: EditText
+    private lateinit var etMinLoops: EditText
+    private lateinit var etMaxLoops: EditText
 
     private lateinit var fileGif1: File
     private lateinit var fileGif2: File
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // 隐藏标题栏
+        requestWindowFeature(Window.FEATURE_NO_TITLE)
         super.onCreate(savedInstanceState)
 
         fileGif1 = File(filesDir, "gif1.gif")
@@ -65,22 +68,22 @@ class MainActivity : Activity() {
         layout.addView(tvGif2, matchWrap())
         layout.addView(tvInfo2, matchWrap())
 
-        val tvTimeTitle = TextView(this).apply {
-            text = "随机触发间隔设置 (单位: 秒)"
+        val tvLoopTitle = TextView(this).apply {
+            text = "主 GIF 播放轮数设置"
             textSize = 18f
             setPadding(0, 30, 0, 20)
         }
-        layout.addView(tvTimeTitle)
+        layout.addView(tvLoopTitle)
 
-        val timeLayout = LinearLayout(this).apply {
+        val loopLayout = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
-        etMinTime = EditText(this).apply { hint = "最小间隔(如10)"; setText("15") }
-        etMaxTime = EditText(this).apply { hint = "最大间隔(如30)"; setText("45") }
-        timeLayout.addView(etMinTime, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        timeLayout.addView(etMaxTime, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        layout.addView(timeLayout)
+        etMinLoops = EditText(this).apply { hint = "最小轮数(如3)"; setText("3") }
+        etMaxLoops = EditText(this).apply { hint = "最大轮数(如7)"; setText("7") }
+        loopLayout.addView(etMinLoops, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        loopLayout.addView(etMaxLoops, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        layout.addView(loopLayout)
 
         val btnSave = Button(this).apply {
             text = "保存参数"
@@ -217,26 +220,26 @@ class MainActivity : Activity() {
     }
 
     private fun saveSettings() {
-        var min = etMinTime.text.toString().toIntOrNull() ?: 15
-        var max = etMaxTime.text.toString().toIntOrNull() ?: 45
+        var min = etMinLoops.text.toString().toIntOrNull() ?: 3
+        var max = etMaxLoops.text.toString().toIntOrNull() ?: 7
         if (min <= 0) min = 1
         if (max <= 0) max = 1
         if (min > max) {
             val t = min; min = max; max = t
         }
-        etMinTime.setText(min.toString())
-        etMaxTime.setText(max.toString())
+        etMinLoops.setText(min.toString())
+        etMaxLoops.setText(max.toString())
 
         getSharedPreferences("PetPrefs", Context.MODE_PRIVATE)
             .edit()
-            .putInt("minTime", min)
-            .putInt("maxTime", max)
+            .putInt("minLoops", min)
+            .putInt("maxLoops", max)
             .apply()
     }
 
     private fun loadSettings() {
         val prefs = getSharedPreferences("PetPrefs", Context.MODE_PRIVATE)
-        etMinTime.setText(prefs.getInt("minTime", 15).toString())
-        etMaxTime.setText(prefs.getInt("maxTime", 45).toString())
+        etMinLoops.setText(prefs.getInt("minLoops", 3).toString())
+        etMaxLoops.setText(prefs.getInt("maxLoops", 7).toString())
     }
 }

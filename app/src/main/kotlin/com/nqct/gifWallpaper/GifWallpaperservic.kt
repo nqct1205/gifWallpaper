@@ -33,9 +33,9 @@ class GifWallpaperService : WallpaperService() {
 
         private var isPlayingSecond = false
 
-        // 计时/计圈相关
-        private var minIntervalMs = 15_000L
-        private var maxIntervalMs = 45_000L
+        // 轮数控制
+        private var minLoops = 3
+        private var maxLoops = 7
         private var currentLoops = 0
         private var targetLoops = 3
 
@@ -78,7 +78,7 @@ class GifWallpaperService : WallpaperService() {
                     } else {
                         // 如果没设副 GIF，继续重置圈数循环
                         currentLoops = 0
-                        calculateTargetLoops()
+                        targetLoops = if (maxLoops > minLoops) (minLoops..maxLoops).random() else minLoops
                         anim1?.start()
                     }
                 } else {
@@ -117,31 +117,31 @@ class GifWallpaperService : WallpaperService() {
             loaderThread = Thread {
                 try {
                     val prefs = getSharedPreferences("PetPrefs", Context.MODE_PRIVATE)
-                    var minSec = prefs.getInt("minTime", 15)
-                    var maxSec = prefs.getInt("maxTime", 45)
-                    if (minSec <= 0) minSec = 1
-                    if (maxSec <= 0) maxSec = 1
-                    if (minSec > maxSec) {
-                        val t = minSec; minSec = maxSec; maxSec = t
+                    var minL = prefs.getInt("minLoops", 3)
+                    var maxL = prefs.getInt("maxLoops", 7)
+                    if (minL <= 0) minL = 1
+                    if (maxL <= 0) maxL = 1
+                    if (minL > maxL) {
+                        val t = minL; minL = maxL; maxL = t
                     }
 
                     val file1 = File(filesDir, "gif1.gif")
                     val file2 = File(filesDir, "gif2.gif")
 
                     val a1 = decodeAnimatedDrawable(file1)
-                    // 关键：主 GIF 也改为单次播放，交给回调控制圈数
-                    a1?.repeatCount = 1 
+                    // 注意：AnimatedImageDrawable 中 repeatCount=0 代表播放 1 次
+                    a1?.repeatCount = 0 
                     
                     val a2 = decodeAnimatedDrawable(file2)
-                    a2?.repeatCount = 1
+                    a2?.repeatCount = 0
                     
                     val i1 = GifMetadataParser.parse(file1)
                     val i2 = GifMetadataParser.parse(file2)
 
                     handler.post {
                         if (destroyed) return@post
-                        minIntervalMs = minSec * 1000L
-                        maxIntervalMs = maxSec * 1000L
+                        minLoops = minL
+                        maxLoops = maxL
                         
                         anim1 = a1
                         anim2 = a2
@@ -181,23 +181,10 @@ class GifWallpaperService : WallpaperService() {
         private fun switchToMainGifInternal() {
             isPlayingSecond = false
             currentLoops = 0
-            calculateTargetLoops()
+            targetLoops = if (maxLoops > minLoops) (minLoops..maxLoops).random() else minLoops
             anim2?.stop()
             anim1?.start()
             pausedAt = 0L
-        }
-
-        /** 把原本的毫秒时间，换算成主 GIF 需要播放的圈数 */
-        private fun calculateTargetLoops() {
-            val totalDuration = info1?.totalDelayMs ?: 0
-            if (totalDuration > 0) {
-                // 例如原设定 15~45秒，主GIF一圈6秒，则圈数=3~8圈
-                val minLoops = Math.round(minIntervalMs.toFloat() / totalDuration).coerceAtLeast(1)
-                val maxLoops = Math.round(maxIntervalMs.toFloat() / totalDuration).coerceAtLeast(minLoops)
-                targetLoops = if (maxLoops > minLoops) (minLoops..maxLoops).random() else minLoops
-            } else {
-                targetLoops = 3 // 解析失败时的兜底圈数
-            }
         }
 
         override fun onVisibilityChanged(visible: Boolean) {
@@ -292,7 +279,7 @@ class GifWallpaperService : WallpaperService() {
                 }
 
                 // ======== 调试代码开始 ========
-                drawDebugInfo(canvas, currentAnim, currentInfo)
+                drawDebugInfo(canvas, currentInfo)
                 // ======== 调试代码结束 ========
 
                 return currentInfo?.frameIntervalMs(0) ?: 33L
@@ -316,7 +303,7 @@ class GifWallpaperService : WallpaperService() {
         }
 
         // ======== 调试代码开始 ========
-        private fun drawDebugInfo(canvas: Canvas, drawable: AnimatedImageDrawable, info: GifInfo?) {
+        private fun drawDebugInfo(canvas: Canvas, info: GifInfo?) {
             val now = SystemClock.elapsedRealtime()
             
             if (now - lastMemoryUpdateTime > 1000) {
