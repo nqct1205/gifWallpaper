@@ -1,74 +1,116 @@
 package com.nqct.gifWallpaper
 
 import android.app.Activity
-import android.app.AlertDialog
 import android.content.ComponentName
-import android.content.Context
 import android.content.Intent
-import android.graphics.Color
 import android.os.Bundle
-import android.text.Editable
-import android.text.InputType
-import android.text.TextWatcher
-import android.view.Gravity
-import android.view.View
-import android.view.ViewGroup
 import android.view.Window
-import android.widget.*
+import android.widget.ScrollView
+import android.widget.Toast
 import java.io.File
 import java.io.FileOutputStream
 
+/**
+ * 应用配置入口 Activity。
+ *
+ * 职责：
+ *  - 生命周期（onCreate / onResume / onBackPressed）；
+ *  - 数据加载与文件同步（loadData / syncWithFiles）；
+ *  - 页面导航（showMainPage / showEditorPage → 委托给对应 Builder）；
+ *  - ActivityResult 分发（文件选择 / JSON 导入导出 / 重映射）。
+ */
 class MainActivity : Activity() {
 
-    private lateinit var rootLayout: LinearLayout
     private lateinit var animDir: File
     private var stateMachine = StateMachine()
 
+    /** 当前编辑中的状态 ID；null 表示处于主页面 */
     private var editingStateId: String? = null
 
+    /** 上一次加载的警告（配置损坏 / 导入失败等），用于在主页顶部红条显示 */
+    private var lastLoadWarning: String? = null
+
+    /** 上次 onResume 时的同步签名（JSON mtime + GIF 数量），用于跳过无意义的全量 reload */
+    private var lastSyncSignature: String = ""
+
+    private companion object {
+        const val REQ_IMPORT_GIF = 99
+        const val REQ_REPLACE_GIF = 103
+        const val REQ_EXPORT_JSON = 101
+        const val REQ_IMPORT_JSON = 102
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
-        // 隐藏系统的标题栏
         requestWindowFeature(Window.FEATURE_NO_TITLE)
         super.onCreate(savedInstanceState)
 
         animDir = File(filesDir, "animations")
         if (!animDir.exists()) animDir.mkdirs()
 
-        rootLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(40, 40, 40, 40)
-            setBackgroundColor(Color.parseColor("#F5F5F5"))
-        }
-
-        val scrollView = ScrollView(this).apply { addView(rootLayout) }
-        setContentView(scrollView)
-
         loadData()
+        lastSyncSignature = currentSyncSignature()
+        showMainPage()
     }
 
     override fun onResume() {
         super.onResume()
-        // 从壁纸设置页返回时刷新界面
+        // 只有磁盘状态真正变化时才 reload，避免 home 键切后台也全量刷新
         if (editingStateId == null) {
-            loadData()
+            val sig = currentSyncSignature()
+            if (sig != lastSyncSignature) {
+                loadData()
+                lastSyncSignature = sig
+            }
             showMainPage()
         }
     }
 
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (editingStateId != null) {
+            showMainPage()
+        } else {
+            super.onBackPressed()
+        }
+    }
+
+    // ==================== 数据管理 ====================
+
+    private fun currentSyncSignature(): String {
+        val jsonFile = File(filesDir, "state_machine.json")
+        val jsonMod = if (jsonFile.exists()) jsonFile.lastModified() else -1L
+        val gifCount = animDir.listFiles { f -> f.extension.lowercase() == "gif" }?.size ?: 0
+        return "$jsonMod:$gifCount"
+    }
+
+    /**
+     * 加载 stateMachine + 与磁盘文件同步。
+     * 【关键策略】JSON 损坏时保留旧 stateMachine，不覆盖磁盘（避免坏文件毁掉当前配置）。
+     */
     private fun loadData() {
-        stateMachine = StateMachine.load(this)
+        when (val result = StateMachine.load(this)) {
+            is LoadResult.Ok -> {
+                stateMachine = result.sm
+                lastLoadWarning = null
+            }
+            is LoadResult.Corrupted -> {
+                // 保留旧 stateMachine，不覆盖磁盘
+                lastLoadWarning = "⚠ 配置文件损坏，本次未应用: ${result.message}"
+            }
+        }
         syncWithFiles()
     }
 
     /**
-     * 【重要逻辑】文件与状态机数据同步
-     * 1. 如果硬盘上的文件被用户删了，状态机里对应的节点也要删掉。
-     * 2. 如果硬盘新增了文件，状态机里自动创建空节点。
+     * 文件与状态机数据同步：
+     * 1. 硬盘上被用户删掉的文件，状态机里对应的节点同步移除；
+     * 2. 硬盘上新增的 GIF 文件，自动创建空节点；
+     * 3. 若默认起始节点被删，自动回退到第一个文件。
      */
     private fun syncWithFiles() {
         val files = animDir.listFiles { file -> file.extension.lowercase() == "gif" } ?: emptyArray()
         val fileIds = files.map { it.nameWithoutExtension }.toSet()
-        
+
         stateMachine.states.removeAll { it.id !in fileIds }
         for (id in fileIds) {
             if (stateMachine.getState(id) == null) {
@@ -76,98 +118,27 @@ class MainActivity : Activity() {
             }
         }
 
-        // 兜底：如果默认起始节点被删了，自动把第一个文件设为默认
         if (stateMachine.getState(stateMachine.initialStateId) == null) {
             stateMachine.initialStateId = stateMachine.states.firstOrNull()?.id ?: ""
         }
     }
 
-    // ================= 主页面 =================
+    // ==================== 页面导航 ====================
+
     private fun showMainPage() {
         editingStateId = null
-        rootLayout.removeAllViews()
 
-        val title = TextView(this).apply {
-            text = "动画状态机"
-            textSize = 24f
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 30)
-        }
-        rootLayout.addView(title)
-
-        val btnImport = Button(this).apply {
-            text = "导入新动画 (GIF)"
-            setOnClickListener { selectGif() }
-        }
-        rootLayout.addView(btnImport, matchWrap())
-
-        val tvTip = TextView(this).apply {
-            text = "提示：设置完规则后，需重新应用一次动态壁纸生效。"
-            textSize = 12f
-            setTextColor(Color.GRAY)
-            setPadding(0, 10, 0, 20)
-        }
-        rootLayout.addView(tvTip)
-
-        if (stateMachine.states.isEmpty()) {
-            val emptyView = TextView(this).apply {
-                text = "暂无动画，请先导入。"
-                gravity = Gravity.CENTER
-                setPadding(0, 50, 0, 50)
+        val view = MainPageBuilder(this, stateMachine, lastLoadWarning, object : MainPageBuilder.Callbacks {
+            override fun onEditState(stateId: String) {
+                editingStateId = stateId
+                showEditorPage(stateId)
             }
-            rootLayout.addView(emptyView)
-        } else {
-            for (state in stateMachine.states) {
-                val itemLayout = LinearLayout(this).apply {
-                    orientation = LinearLayout.VERTICAL
-                    setPadding(20, 20, 20, 20)
-                    setBackgroundColor(Color.WHITE)
-                    setOnClickListener {
-                        editingStateId = state.id
-                        showEditorPage(state.id)
-                    }
-                }
-                
-                val headerRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-                val nameTv = TextView(this).apply {
-                    text = state.id
-                    textSize = 18f
-                    setTypeface(null, android.graphics.Typeface.BOLD)
-                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                }
-                headerRow.addView(nameTv)
 
-                if (state.id == stateMachine.initialStateId) {
-                    val initialTv = TextView(this).apply {
-                        text = "默认起始"
-                        textSize = 12f
-                        setTextColor(Color.WHITE)
-                        setBackgroundColor(Color.parseColor("#4CAF50"))
-                        setPadding(10, 4, 10, 4)
-                    }
-                    headerRow.addView(initialTv)
-                }
-                itemLayout.addView(headerRow)
-
-                val infoTv = TextView(this).apply {
-                    text = "播放 ${state.minSelfPlay}~${state.maxSelfPlay} 圈后，有 ${state.rules.size} 条转移规则"
-                    textSize = 14f
-                    setTextColor(Color.DKGRAY)
-                    setPadding(0, 10, 0, 0)
-                }
-                itemLayout.addView(infoTv)
-
-                val marginLayout = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                    setMargins(0, 0, 0, 15)
-                }
-                rootLayout.addView(itemLayout, marginLayout)
+            override fun onImportGif() {
+                selectGif()
             }
-        }
 
-        val btnSetWallpaper = Button(this).apply {
-            text = "去应用动态壁纸"
-            setOnClickListener {
+            override fun onApplyWallpaper() {
                 stateMachine.save(this@MainActivity)
                 try {
                     val intent = Intent(android.app.WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
@@ -181,323 +152,68 @@ class MainActivity : Activity() {
                     Toast.makeText(this@MainActivity, "系统不支持动态壁纸设置", Toast.LENGTH_LONG).show()
                 }
             }
-        }
-        val btnParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            setMargins(0, 40, 0, 0)
-        }
-        rootLayout.addView(btnSetWallpaper, btnParams)
 
-        // JSON 导入/导出
-        val ioRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, 20, 0, 0) }
-        val btnExport = Button(this).apply {
-            text = "导出配置"
-            setOnClickListener { exportJson() }
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        val btnImportJson = Button(this).apply {
-            text = "导入配置"
-            setOnClickListener { importJson() }
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        ioRow.addView(btnExport)
-        ioRow.addView(btnImportJson)
-        rootLayout.addView(ioRow)
-
-        // ================= 监控与调试设置（实时热更新） =================
-        val settingsTitle = TextView(this).apply {
-            text = "性能监控设置 (实时生效)"
-            textSize = 16f
-            setPadding(0, 50, 0, 10)
-        }
-        rootLayout.addView(settingsTitle)
-
-        val prefs = getSharedPreferences("PetPrefs", Context.MODE_PRIVATE)
-        
-        val cbShowDebug = CheckBox(this).apply {
-            text = "默认在壁纸中显示调试信息"
-            isChecked = prefs.getBoolean("showDebug", false)
-            setOnCheckedChangeListener { _, isChecked ->
-                prefs.edit().putBoolean("showDebug", isChecked).apply()
+            override fun onExportJson() {
+                exportJson()
             }
-        }
-        rootLayout.addView(cbShowDebug)
 
-        val drawRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, 10, 0, 0) }
-        val tvDrawLabel = TextView(this).apply { text = "渲染耗时上限: "; textSize = 14f }
-        val etLimitDraw = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setText(prefs.getInt("limitDraw", 20).toString())
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            addTextChangedListener(object : TextWatcher {
-                override fun afterTextChanged(s: Editable?) {
-                    val v = s.toString().toIntOrNull() ?: 20
-                    prefs.edit().putInt("limitDraw", v).apply()
-                }
-                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-            })
-        }
-        val tvDrawUnit = TextView(this).apply { text = " ms"; textSize = 14f }
-        drawRow.addView(tvDrawLabel)
-        drawRow.addView(etLimitDraw)
-        drawRow.addView(tvDrawUnit)
-        rootLayout.addView(drawRow)
+            override fun onImportJson() {
+                importJson()
+            }
+        }).build()
 
-        val memRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, 10, 0, 0) }
-        val tvMemLabel = TextView(this).apply { text = "内存占用上限: "; textSize = 14f }
-        val etLimitMem = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setText(prefs.getInt("limitMem", 150).toString())
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            addTextChangedListener(object : TextWatcher {
-                override fun afterTextChanged(s: Editable?) {
-                    val v = s.toString().toIntOrNull() ?: 150
-                    prefs.edit().putInt("limitMem", v).apply()
-                }
-                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-            })
-        }
-        val tvMemUnit = TextView(this).apply { text = " MB"; textSize = 14f }
-        memRow.addView(tvMemLabel)
-        memRow.addView(etLimitMem)
-        memRow.addView(tvMemUnit)
-        rootLayout.addView(memRow)
+        setContentView(ScrollView(this).apply { addView(view) })
     }
 
-    // ================= 编辑页面 =================
     private fun showEditorPage(stateId: String) {
-        val state = stateMachine.getState(stateId) ?: return
-        rootLayout.removeAllViews()
+        if (stateMachine.getState(stateId) == null) {
+            showMainPage()
+            return
+        }
+        editingStateId = stateId
 
-        val topBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        val btnBack = Button(this).apply {
-            text = "< 返回"
-            setOnClickListener { showMainPage() }
-        }
-        topBar.addView(btnBack)
-        val title = TextView(this).apply {
-            text = "配置: $stateId"
-            textSize = 20f
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            setPadding(20, 0, 0, 0)
-        }
-        topBar.addView(title)
-        rootLayout.addView(topBar)
-
-        // 显示源文件详细信息
-        val file = File(animDir, "$stateId.gif")
-        val info = GifMetadataParser.parse(file)
-        val metaText = if (info != null) {
-            "源文件: ${file.name}\n尺寸: ${info.width}x${info.height} | 帧数: ${info.frameCount} | 时长: ${info.totalDelayMs / 1000f}秒"
-        } else {
-            "源文件: ${file.name} (解析失败)"
-        }
-        val tvMeta = TextView(this).apply {
-            text = metaText
-            textSize = 12f
-            setTextColor(Color.GRAY)
-            setPadding(0, 20, 0, 5)
-        }
-        rootLayout.addView(tvMeta)
-
-        // 重命名、重映射、删除
-        val actionRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, 10, 0, 10) }
-        val etRename = EditText(this).apply {
-            setText(stateId)
-            hint = "修改名字"
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        val btnRename = Button(this).apply {
-            text = "改名"
-            setOnClickListener {
-                val newName = etRename.text.toString().trim().replace(Regex("[\\\\/:*?\"<>|]"), "_")
-                if (newName.isEmpty() || newName == stateId) return@setOnClickListener
-                if (stateMachine.getState(newName) != null) {
-                    Toast.makeText(this@MainActivity, "该名字已存在！", Toast.LENGTH_SHORT).show()
-                    return@setOnClickListener
+        val view = EditorPageBuilder(
+            this,
+            animDir,
+            stateMachine,
+            stateId,
+            object : EditorPageBuilder.Callbacks {
+                override fun onBack() {
+                    showMainPage()
                 }
-                val oldFile = File(animDir, "$stateId.gif")
-                val newFile = File(animDir, "$newName.gif")
-                if (oldFile.renameTo(newFile)) {
-                    state.id = newName
-                    // 【重要联动】修改所有指向旧名字的规则
-                    for (s in stateMachine.states) {
-                        for (r in s.rules) if (r.targetId == stateId) r.targetId = newName
-                    }
-                    if (stateMachine.initialStateId == stateId) stateMachine.initialStateId = newName
-                    stateMachine.save(this@MainActivity)
+
+                override fun onRenameSuccess(newId: String) {
                     loadData()
-                    showEditorPage(newName)
-                } else {
-                    Toast.makeText(this@MainActivity, "文件重命名失败", Toast.LENGTH_SHORT).show()
+                    showEditorPage(newId)
                 }
-            }
-        }
-        actionRow.addView(etRename)
-        actionRow.addView(btnRename)
-        rootLayout.addView(actionRow)
 
-        val btnRow2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, 10, 0, 20) }
-        val btnReplace = Button(this).apply {
-            text = "重映射 (替换GIF)"
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener {
-                // 直接覆盖原文件，不改状态机节点名
-                val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
-                    addCategory(Intent.CATEGORY_OPENABLE)
-                    setType("image/gif")
+                override fun onDeleteSuccess() {
+                    loadData()
+                    showMainPage()
                 }
-                startActivityForResult(intent, 103)
-            }
-        }
-        val btnDelete = Button(this).apply {
-            text = "彻底删除"
-            setTextColor(Color.RED)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener {
-                AlertDialog.Builder(this@MainActivity)
-                    .setTitle("确认删除")
-                    .setMessage("删除后将无法恢复，且所有指向它的规则会失效。确定吗？")
-                    .setPositiveButton("删除") { _, _ ->
-                        file.delete()
-                        stateMachine.states.remove(state)
-                        // 清理其他节点中指向它的规则
-                        for (s in stateMachine.states) {
-                            s.rules.removeAll { it.targetId == stateId }
-                        }
-                        if (stateMachine.initialStateId == stateId) {
-                            stateMachine.initialStateId = stateMachine.states.firstOrNull()?.id ?: ""
-                        }
-                        stateMachine.save(this@MainActivity)
-                        loadData()
-                        showMainPage()
-                        Toast.makeText(this@MainActivity, "已删除", Toast.LENGTH_SHORT).show()
+
+                override fun onRequestReplaceGif() {
+                    val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        setType("image/gif")
                     }
-                    .setNegativeButton("取消", null)
-                    .show()
-            }
-        }
-        btnRow2.addView(btnReplace)
-        btnRow2.addView(btnDelete)
-        rootLayout.addView(btnRow2)
+                    startActivityForResult(intent, REQ_REPLACE_GIF)
+                }
 
-        if (stateMachine.initialStateId != state.id) {
-            val btnSetInitial = Button(this).apply {
-                text = "设为默认起始动画"
-                setOnClickListener {
-                    stateMachine.initialStateId = state.id
-                    stateMachine.save(this@MainActivity)
-                    Toast.makeText(this@MainActivity, "已设为起始", Toast.LENGTH_SHORT).show()
-                    showEditorPage(state.id)
+                override fun onSaved() {
+                    showMainPage()
+                }
+
+                override fun onRefresh() {
+                    showEditorPage(stateId)
                 }
             }
-            rootLayout.addView(btnSetInitial, matchWrap())
-        }
+        ).build()
 
-        val playTitle = TextView(this).apply { text = "自身播放次数范围"; textSize = 16f; setPadding(0, 20, 0, 10) }
-        rootLayout.addView(playTitle)
-        
-        val playRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val etMin = EditText(this).apply { inputType = InputType.TYPE_CLASS_NUMBER; setText(state.minSelfPlay.toString()); hint = "最小" }
-        val etMax = EditText(this).apply { inputType = InputType.TYPE_CLASS_NUMBER; setText(state.maxSelfPlay.toString()); hint = "最大" }
-        playRow.addView(etMin, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        playRow.addView(etMax, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        rootLayout.addView(playRow)
-
-        val ruleTitle = TextView(this).apply { text = "转移规则 (权重)"; textSize = 16f; setPadding(0, 30, 0, 10) }
-        rootLayout.addView(ruleTitle)
-
-        val rulesContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        rootLayout.addView(rulesContainer, matchWrap())
-        val percentTextViews = mutableListOf<TextView>()
-
-        // 【坑点】权重修改不能刷新整个UI，否则输入框焦点会丢失，变成只能输入一位数。只能局部刷新百分比。
-        fun updatePercentages() {
-            val totalWeight = state.rules.sumOf { it.weight.coerceAtLeast(0) }.coerceAtLeast(1)
-            for (i in state.rules.indices) {
-                if (i < percentTextViews.size) {
-                    percentTextViews[i].text = " ${(state.rules[i].weight.toFloat() / totalWeight * 100).toInt()}% "
-                }
-            }
-        }
-
-        fun refreshRulesUI() {
-            rulesContainer.removeAllViews()
-            percentTextViews.clear()
-            for (i in state.rules.indices) {
-                val rule = state.rules[i]
-                val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, 10, 0, 10) }
-                
-                val spinner = Spinner(this).apply {
-                    val ids = stateMachine.states.map { it.id }
-                    adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, ids)
-                    setSelection(ids.indexOf(rule.targetId).coerceAtLeast(0))
-                    onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-                        override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) { rule.targetId = ids[position] }
-                        override fun onNothingSelected(parent: AdapterView<*>?) {}
-                    }
-                }
-                row.addView(spinner, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.2f))
-
-                val etWeight = EditText(this).apply {
-                    inputType = InputType.TYPE_CLASS_NUMBER
-                    setText(rule.weight.toString())
-                    addTextChangedListener(object : TextWatcher {
-                        override fun afterTextChanged(s: Editable?) {
-                            rule.weight = s.toString().toIntOrNull() ?: 0
-                            updatePercentages()
-                        }
-                        override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-                        override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-                    })
-                }
-                row.addView(etWeight, LinearLayout.LayoutParams(100, ViewGroup.LayoutParams.WRAP_CONTENT))
-
-                val tvPercent = TextView(this).apply { textSize = 14f; setTextColor(Color.parseColor("#2196F3")) }
-                percentTextViews.add(tvPercent)
-                row.addView(tvPercent)
-
-                val btnDel = Button(this).apply {
-                    text = "X"
-                    setTextColor(Color.RED)
-                    setOnClickListener { state.rules.removeAt(i); refreshRulesUI() }
-                }
-                row.addView(btnDel)
-                rulesContainer.addView(row)
-            }
-            updatePercentages()
-        }
-        refreshRulesUI()
-
-        val btnAddRule = Button(this).apply {
-            text = "+ 添加转移规则"
-            setOnClickListener {
-                if (stateMachine.states.isNotEmpty()) {
-                    state.rules.add(TransitionRule(targetId = stateMachine.states.first().id, weight = 1))
-                    refreshRulesUI()
-                }
-            }
-        }
-        rootLayout.addView(btnAddRule, matchWrap())
-
-        val btnSave = Button(this).apply {
-            text = "保存规则"
-            setBackgroundColor(Color.parseColor("#4CAF50"))
-            setTextColor(Color.WHITE)
-            setOnClickListener {
-                state.minSelfPlay = etMin.text.toString().toIntOrNull() ?: 1
-                state.maxSelfPlay = etMax.text.toString().toIntOrNull() ?: 1
-                if (state.minSelfPlay <= 0) state.minSelfPlay = 1
-                if (state.maxSelfPlay < state.minSelfPlay) state.maxSelfPlay = state.minSelfPlay
-                stateMachine.save(this@MainActivity)
-                Toast.makeText(this@MainActivity, "规则已保存！", Toast.LENGTH_SHORT).show()
-                showMainPage()
-            }
-        }
-        val btnSaveParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(0, 40, 0, 0) }
-        rootLayout.addView(btnSave, btnSaveParams)
+        setContentView(ScrollView(this).apply { addView(view) })
     }
+
+    // ==================== 文件操作 ====================
 
     private fun exportJson() {
         stateMachine.save(this)
@@ -506,7 +222,7 @@ class MainActivity : Activity() {
             type = "application/json"
             putExtra(Intent.EXTRA_TITLE, "state_machine_backup.json")
         }
-        startActivityForResult(intent, 101)
+        startActivityForResult(intent, REQ_EXPORT_JSON)
     }
 
     private fun importJson() {
@@ -514,18 +230,18 @@ class MainActivity : Activity() {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "application/json"
         }
-        startActivityForResult(intent, 102)
+        startActivityForResult(intent, REQ_IMPORT_JSON)
     }
-
-    private fun matchWrap() = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
 
     private fun selectGif() {
         val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             setType("image/gif")
         }
-        startActivityForResult(intent, 99)
+        startActivityForResult(intent, REQ_IMPORT_GIF)
     }
+
+    // ==================== ActivityResult 分发 ====================
 
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -534,71 +250,114 @@ class MainActivity : Activity() {
         val uri = data.data!!
 
         when (requestCode) {
-            99 -> {
-                try {
-                    // 【坑点】通过 ContentResolver 获取系统真实的文件名，而不是乱编一个名字
-                    var displayName = "anim_${System.currentTimeMillis()}.gif"
-                    contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                        if (cursor.moveToFirst()) {
-                            val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                            if (nameIndex >= 0) {
-                                val originalName = cursor.getString(nameIndex)
-                                if (!originalName.isNullOrBlank()) {
-                                    displayName = if (originalName.lowercase().endsWith(".gif")) originalName else "$originalName.gif"
-                                }
+            REQ_IMPORT_GIF -> importNewGif(uri)
+            REQ_REPLACE_GIF -> replaceCurrentGif(uri)
+            REQ_EXPORT_JSON -> exportJsonTo(uri)
+            REQ_IMPORT_JSON -> importJsonFrom(uri)
+        }
+    }
+
+    /** 处理"导入新 GIF"。 */
+    private fun importNewGif(uri: android.net.Uri) {
+        try {
+            var displayName = "anim_${System.currentTimeMillis()}.gif"
+            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (nameIndex >= 0) {
+                        val originalName = cursor.getString(nameIndex)
+                        if (!originalName.isNullOrBlank()) {
+                            displayName = if (originalName.lowercase().endsWith(".gif")) {
+                                originalName
+                            } else {
+                                "$originalName.gif"
                             }
                         }
                     }
-                    displayName = displayName.replace(Regex("[\\\\/:*?\"<>|]"), "_")
-                    val targetFile = File(animDir, displayName)
-                    contentResolver.openInputStream(uri)?.use { input ->
-                        FileOutputStream(targetFile).use { output -> input.copyTo(output) }
-                    }
-                    loadData()
-                    showMainPage()
-                    Toast.makeText(this, "导入成功: ${targetFile.nameWithoutExtension}", Toast.LENGTH_SHORT).show()
-                } catch (e: Exception) {
-                    Toast.makeText(this, "导入失败: ${e.message}", Toast.LENGTH_SHORT).show()
                 }
             }
-            103 -> {
-                try {
-                    val currentId = editingStateId ?: return
-                    val targetFile = File(animDir, "$currentId.gif")
-                    contentResolver.openInputStream(uri)?.use { input ->
-                        FileOutputStream(targetFile).use { output -> input.copyTo(output) }
-                    }
-                    loadData()
-                    Toast.makeText(this, "GIF 文件已被替换，规则保持不变！", Toast.LENGTH_SHORT).show()
-                    showEditorPage(currentId)
-                } catch (e: Exception) {
-                    Toast.makeText(this, "替换失败: ${e.message}", Toast.LENGTH_SHORT).show()
-                }
+
+            // 【统一清洗文件名】去掉非法字符 / 前置点 / 超长
+            val base = displayName.substringBeforeLast('.', displayName)
+            val safeBase = sanitizeFileName(base)
+            displayName = "$safeBase.gif"
+
+            val targetFile = File(animDir, displayName)
+            contentResolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(targetFile).use { output -> input.copyTo(output) }
             }
-            101 -> {
-                try {
-                    val jsonFile = File(filesDir, "state_machine.json")
-                    contentResolver.openOutputStream(uri)?.use { output ->
-                        jsonFile.inputStream().use { input -> input.copyTo(output) }
-                    }
-                    Toast.makeText(this, "配置导出成功！", Toast.LENGTH_SHORT).show()
-                } catch (e: Exception) {
-                    Toast.makeText(this, "导出失败: ${e.message}", Toast.LENGTH_SHORT).show()
-                }
+            loadData()
+            lastSyncSignature = currentSyncSignature()
+            showMainPage()
+            Toast.makeText(this, "导入成功: ${targetFile.nameWithoutExtension}", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "导入失败: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** 处理"重映射替换当前 GIF"。 */
+    private fun replaceCurrentGif(uri: android.net.Uri) {
+        try {
+            val currentId = editingStateId ?: return
+            val targetFile = File(animDir, "$currentId.gif")
+            contentResolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(targetFile).use { output -> input.copyTo(output) }
             }
-            102 -> {
-                try {
-                    val jsonFile = File(filesDir, "state_machine.json")
-                    contentResolver.openInputStream(uri)?.use { input ->
-                        FileOutputStream(jsonFile).use { output -> input.copyTo(output) }
-                    }
+            loadData()
+            lastSyncSignature = currentSyncSignature()
+            Toast.makeText(this, "GIF 文件已被替换，规则保持不变！", Toast.LENGTH_SHORT).show()
+            showEditorPage(currentId)
+        } catch (e: Exception) {
+            Toast.makeText(this, "替换失败: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** 处理"导出配置"。 */
+    private fun exportJsonTo(uri: android.net.Uri) {
+        try {
+            val jsonFile = File(filesDir, "state_machine.json")
+            contentResolver.openOutputStream(uri)?.use { output ->
+                jsonFile.inputStream().use { input -> input.copyTo(output) }
+            }
+            Toast.makeText(this, "配置导出成功！", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "导出失败: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * 处理"导入配置"。
+     * 【关键策略】先解析验证，损坏时不覆盖当前配置，仅在主页顶部提示。
+     */
+    private fun importJsonFrom(uri: android.net.Uri) {
+        try {
+            val text = contentResolver.openInputStream(uri)?.use {
+                it.readBytes().toString(Charsets.UTF_8)
+            } ?: throw IllegalArgumentException("无法读取文件")
+
+            // 先写临时文件，用 StateMachine.load 验证
+            val tmp = File(filesDir, "state_machine_import_tmp.json")
+            tmp.writeText(text)
+            val result = StateMachine.load(tmp)
+            tmp.delete()
+
+            when (result) {
+                is LoadResult.Ok -> {
+                    File(filesDir, "state_machine.json").writeText(text)
                     loadData()
+                    lastSyncSignature = currentSyncSignature()
                     showMainPage()
                     Toast.makeText(this, "配置导入成功！", Toast.LENGTH_SHORT).show()
-                } catch (e: Exception) {
-                    Toast.makeText(this, "导入失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+                is LoadResult.Corrupted -> {
+                    // 保留旧数据
+                    lastLoadWarning = "⚠ 导入失败，文件损坏未应用: ${result.message}"
+                    showMainPage()
+                    Toast.makeText(this, "导入失败: 文件损坏", Toast.LENGTH_LONG).show()
                 }
             }
+        } catch (e: Exception) {
+            Toast.makeText(this, "导入失败: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 }
