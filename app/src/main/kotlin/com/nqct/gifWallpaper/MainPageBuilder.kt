@@ -3,35 +3,46 @@ package com.nqct.gifWallpaper
 import android.app.Activity
 import android.content.Context
 import android.graphics.Color
+import android.graphics.Typeface
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.widget.*
+import android.widget.Button
+import android.widget.CheckBox
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.TextView
 
 /**
  * 主页面构建器。
  *
- * 只负责生成主页面 UI 并处理页面内的局部交互；
- * 涉及"跳转编辑页 / 启动 Intent / 应用壁纸"等跨页面或系统级操作，
- * 统一通过 [Callbacks] 交给 [MainActivity] 处理。
+ * 【展示内容】
+ *  - 顶部警告条（配置损坏等）。
+ *  - 五个入口卡片：资源 / 动画 / 状态 / 事件规则 / 状态图。
+ *  - 默认状态设置入口（显示“状态名 (id)”）。
+ *  - 应用壁纸按钮。
+ *  - 调试设置（SharedPreferences，实时同步到壁纸服务）。
+ *
+ * 【职责边界】本类只负责 UI 与触发回调；数据修改与持久化由 [MainActivity] 完成。
  */
 class MainPageBuilder(
     private val activity: Activity,
-    private val stateMachine: StateMachine,
-    /** 顶部红色警告（配置损坏 / 导入失败等）；null 或空则不显示 */
+    private val config: ProjectConfig,
     private val warningMessage: String?,
     private val callbacks: Callbacks
 ) {
 
     interface Callbacks {
-        fun onEditState(stateId: String)
-        fun onImportGif()
+        fun onOpenResources()
+        fun onOpenAnimations()
+        fun onOpenStates()
+        fun onOpenEventRules()
+        fun onOpenStateGraph()
+        fun onSetDefaultState()
         fun onApplyWallpaper()
-        fun onExportJson()
-        fun onImportJson()
     }
 
     fun build(): View {
@@ -43,14 +54,14 @@ class MainPageBuilder(
 
         // ---- 标题 ----
         root.addView(TextView(activity).apply {
-            text = "动画状态机"
+            text = "GIF 动态壁纸"
             textSize = 24f
-            setTypeface(null, android.graphics.Typeface.BOLD)
+            setTypeface(null, Typeface.BOLD)
             gravity = Gravity.CENTER
             setPadding(0, 0, 0, 30)
         })
 
-        // ---- 顶部警告条（配置损坏 / 导入失败） ----
+        // ---- 警告条 ----
         if (!warningMessage.isNullOrBlank()) {
             root.addView(TextView(activity).apply {
                 text = warningMessage
@@ -58,60 +69,40 @@ class MainPageBuilder(
                 setTextColor(Color.WHITE)
                 setBackgroundColor(Color.parseColor("#D32F2F"))
                 setPadding(20, 15, 20, 15)
-            }, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 0, 0, 20) })
+            }, matchWrapWithMargins(bottom = 20))
         }
 
-        // ---- 导入新动画 ----
-        root.addView(Button(activity).apply {
-            text = "导入新动画 (GIF)"
-            setOnClickListener { callbacks.onImportGif() }
-        }, matchWrap())
+        // ---- 统计 + 入口 ----
+        root.addView(buildEntryCard("资源", config.resources.size) { callbacks.onOpenResources() },
+            matchWrapWithMargins(bottom = 10))
+        root.addView(buildEntryCard("动画", config.animations.size) { callbacks.onOpenAnimations() },
+            matchWrapWithMargins(bottom = 10))
+        root.addView(buildEntryCard("状态", config.states.size) { callbacks.onOpenStates() },
+            matchWrapWithMargins(bottom = 10))
+        root.addView(buildEntryCard("事件规则", config.eventRules.size) { callbacks.onOpenEventRules() },
+            matchWrapWithMargins(bottom = 10))
+        root.addView(buildEntryCard("状态图", config.states.size) { callbacks.onOpenStateGraph() },
+            matchWrapWithMargins(bottom = 20))
 
-        // ---- 提示 ----
-        root.addView(TextView(activity).apply {
-            text = "提示：设置完规则后，需重新应用一次动态壁纸生效。"
-            textSize = 12f
-            setTextColor(Color.GRAY)
-            setPadding(0, 10, 0, 20)
-        })
-
-        // ---- 状态列表 ----
-        if (stateMachine.states.isEmpty()) {
-            root.addView(TextView(activity).apply {
-                text = "暂无动画，请先导入。"
-                gravity = Gravity.CENTER
-                setPadding(0, 50, 0, 50)
-            })
-        } else {
-            for (state in stateMachine.states) {
-                root.addView(buildStateItem(state), LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { setMargins(0, 0, 0, 15) })
-            }
-        }
+        // ---- 默认状态 ----
+        root.addView(buildDefaultStateRow(), matchWrapWithMargins(bottom = 30))
 
         // ---- 应用壁纸 ----
         root.addView(Button(activity).apply {
-            text = "去应用动态壁纸"
+            text = "应用动态壁纸"
+            setBackgroundColor(Color.parseColor("#4CAF50"))
+            setTextColor(Color.WHITE)
             setOnClickListener { callbacks.onApplyWallpaper() }
-        }, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ).apply { setMargins(0, 40, 0, 0) })
+        }, matchWrapWithMargins(bottom = 10))
 
-        // ---- JSON 导入 / 导出 ----
-        root.addView(buildIoRow())
-
-        // ---- 监控与调试设置 ----
         root.addView(TextView(activity).apply {
-            text = "性能监控设置 (实时生效)"
-            textSize = 16f
-            setPadding(0, 50, 0, 10)
+            text = "提示：修改规则或动画后需重新应用一次动态壁纸才会生效。"
+            textSize = 12f
+            setTextColor(Color.GRAY)
+            setPadding(0, 5, 0, 0)
         })
+
+        // ---- 调试设置 ----
         buildMonitorSettings(root)
 
         return root
@@ -119,85 +110,93 @@ class MainPageBuilder(
 
     // ==================== 子模块构建 ====================
 
-    private fun buildStateItem(state: StateNode): View {
-        val itemLayout = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(20, 20, 20, 20)
+    /** 入口卡片：标题 + 数量 + 箭头，整行可点击。 */
+    private fun buildEntryCard(title: String, count: Int, onClick: () -> Unit): View {
+        return LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(30, 30, 30, 30)
             setBackgroundColor(Color.WHITE)
-            setOnClickListener { callbacks.onEditState(state.id) }
-        }
+            setOnClickListener { onClick() }
 
-        val headerRow = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
-        headerRow.addView(TextView(activity).apply {
-            text = state.id
-            textSize = 18f
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        })
-
-        if (state.id == stateMachine.initialStateId) {
-            headerRow.addView(TextView(activity).apply {
-                text = "默认起始"
-                textSize = 12f
-                setTextColor(Color.WHITE)
-                setBackgroundColor(Color.parseColor("#4CAF50"))
-                setPadding(10, 4, 10, 4)
+            addView(TextView(activity).apply {
+                text = title
+                textSize = 16f
+                setTypeface(null, Typeface.BOLD)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            addView(TextView(activity).apply {
+                text = count.toString()
+                textSize = 16f
+                setTextColor(Color.parseColor("#2196F3"))
+                setPadding(0, 0, 20, 0)
+            })
+            addView(TextView(activity).apply {
+                text = ">"
+                textSize = 18f
+                setTextColor(Color.GRAY)
             })
         }
-        itemLayout.addView(headerRow)
-
-        itemLayout.addView(TextView(activity).apply {
-            text = "播放 ${state.minSelfPlay}~${state.maxSelfPlay} 圈后，有 ${state.rules.size} 条转移规则"
-            textSize = 14f
-            setTextColor(Color.DKGRAY)
-            setPadding(0, 10, 0, 0)
-        })
-
-        return itemLayout
     }
 
-    private fun buildIoRow(): View {
-        val row = LinearLayout(activity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, 20, 0, 0)
+    /** 默认状态行：显示“状态名 (id)”，点击打开选择弹窗。 */
+    private fun buildDefaultStateRow(): View {
+        val current = if (config.defaultStateId.isEmpty()) {
+            "未设置"
+        } else {
+            formatStateDisplay(config.states[config.defaultStateId])
         }
-        row.addView(Button(activity).apply {
-            text = "导出配置"
-            setOnClickListener { callbacks.onExportJson() }
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        })
-        row.addView(Button(activity).apply {
-            text = "导入配置"
-            setOnClickListener { callbacks.onImportJson() }
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        })
-        return row
+        return LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(30, 20, 30, 20)
+            setBackgroundColor(Color.WHITE)
+            setOnClickListener { callbacks.onSetDefaultState() }
+
+            addView(TextView(activity).apply {
+                text = "默认状态"
+                textSize = 15f
+                setTypeface(null, Typeface.BOLD)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            addView(TextView(activity).apply {
+                text = current
+                textSize = 14f
+                setTextColor(Color.parseColor("#2196F3"))
+                setPadding(0, 0, 10, 0)
+            })
+            addView(TextView(activity).apply {
+                text = ">"
+                textSize = 18f
+                setTextColor(Color.GRAY)
+            })
+        }
     }
 
+    /**
+     * 调试设置：写入 SharedPreferences "PetPrefs"，
+     * 壁纸服务已注册监听，会实时读取。
+     */
     private fun buildMonitorSettings(root: LinearLayout) {
         val prefs = activity.getSharedPreferences("PetPrefs", Context.MODE_PRIVATE)
 
+        root.addView(TextView(activity).apply {
+            text = "调试设置"
+            textSize = 16f
+            setTypeface(null, Typeface.BOLD)
+            setPadding(0, 50, 0, 10)
+        })
+
         root.addView(CheckBox(activity).apply {
-            text = "默认在壁纸中显示调试信息"
+            text = "在壁纸中显示调试信息"
             isChecked = prefs.getBoolean("showDebug", false)
-            setOnCheckedChangeListener { _, isChecked ->
-                prefs.edit().putBoolean("showDebug", isChecked).apply()
+            setOnCheckedChangeListener { _, checked ->
+                prefs.edit().putBoolean("showDebug", checked).apply()
             }
         })
 
-        root.addView(buildNumberInputRow(
-            label = "渲染耗时上限: ",
-            unit = " ms",
-            prefKey = "limitDraw",
-            defaultValue = 20
-        ))
-
-        root.addView(buildNumberInputRow(
-            label = "内存占用上限: ",
-            unit = " MB",
-            prefKey = "limitMem",
-            defaultValue = 150
-        ))
+        root.addView(buildNumberInputRow("渲染耗时上限: ", " ms", "limitDraw", 20))
+        root.addView(buildNumberInputRow("内存占用上限: ", " MB", "limitMem", 150))
     }
 
     private fun buildNumberInputRow(
@@ -212,8 +211,9 @@ class MainPageBuilder(
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, 10, 0, 0)
         }
-        row.addView(TextView(activity).apply { text = label; textSize = 14f })
-
+        row.addView(TextView(activity).apply {
+            text = label; textSize = 14f
+        })
         row.addView(EditText(activity).apply {
             inputType = InputType.TYPE_CLASS_NUMBER
             setText(prefs.getInt(prefKey, defaultValue).toString())
@@ -221,19 +221,25 @@ class MainPageBuilder(
             addTextChangedListener(object : TextWatcher {
                 override fun afterTextChanged(s: Editable?) {
                     val v = s.toString().toIntOrNull() ?: defaultValue
-                    prefs.edit().putInt(prefKey, v).apply()
+                    if (v > 0) prefs.edit().putInt(prefKey, v).apply()
                 }
                 override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
             })
         })
-
-        row.addView(TextView(activity).apply { text = unit; textSize = 14f })
+        row.addView(TextView(activity).apply {
+            text = unit; textSize = 14f
+        })
         return row
     }
 
-    private fun matchWrap() = LinearLayout.LayoutParams(
+    // ==================== 布局参数工具 ====================
+
+    private fun matchWrapWithMargins(
+        bottom: Int = 0,
+        top: Int = 0
+    ) = LinearLayout.LayoutParams(
         ViewGroup.LayoutParams.MATCH_PARENT,
         ViewGroup.LayoutParams.WRAP_CONTENT
-    )
+    ).apply { setMargins(0, top, 0, bottom) }
 }

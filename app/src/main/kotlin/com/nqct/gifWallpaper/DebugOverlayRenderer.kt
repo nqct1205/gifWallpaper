@@ -12,7 +12,16 @@ import java.util.Locale
  */
 class DebugOverlayRenderer {
 
+    /**
+     * 调试面板数据快照。
+     *
+     * 【显示文本说明】[stateName] 与 [animationDisplay] 由调用方传入**已格式化**的字符串，
+     * 本类不做名字/id 拼接（保持绘制器与数据模型解耦）。
+     * 调用方（[GifWallpaperService.buildDebugState]）使用
+     * `formatStateDisplay` / `formatAnimDisplay` 生成"名字 (id)"格式。
+     */
     data class DebugState(
+        /** 状态的显示文本：名字 (id)；无状态时为 "None" */
         val stateName: String,
         val currentPlayCount: Int,
         val targetSelfPlay: Int,
@@ -24,7 +33,17 @@ class DebugOverlayRenderer {
         val limitMemory: Int,
         val frameIntervalMs: Long,
         val isAlarm: Boolean,
-        val hasError: Boolean
+        val hasError: Boolean,
+        /** 帧索引是否为估算值（基于时间轴推算，非精确帧回调） */
+        val frameIndexIsEstimate: Boolean = true,
+        /** 动画的显示文本：名字 (id)；无动画时为 "无" */
+        val animationDisplay: String = "",
+        /** 传感器姿态文本 */
+        val postureText: String = "",
+        /** 摇一摇冷却中 */
+        val isShaking: Boolean = false,
+        /** 当前触摸中 */
+        val isTouching: Boolean = false
     )
 
     private val debugTextPaint = Paint().apply {
@@ -85,16 +104,25 @@ class DebugOverlayRenderer {
     fun drawDebugInfo(canvas: Canvas, s: DebugState) {
         val warnSign = if (s.isAlarm) " [⚠ 超阈值]" else ""
 
+        val estimateMark = if (s.frameIndexIsEstimate) " (估算)" else ""
         val frameText = if (s.frameIndex >= 0 && s.frameCount > 0) {
-            " 第 ${s.frameIndex + 1}/${s.frameCount} 帧"
+            " 第 ${s.frameIndex + 1}/${s.frameCount} 帧$estimateMark"
         } else ""
+
+        val sensorText = buildString {
+            if (s.postureText.isNotEmpty()) append("\n姿态: ${s.postureText}")
+            if (s.isShaking) append("  [摇一摇冷却中]")
+            if (s.isTouching) append("  [触摸中]")
+        }
 
         val memoryText = String.format(
             Locale.US,
-            "状态: %s (第 %d/%d 圈%s)%s\n当前帧耗时: %.2f ms (限 %d ms)\n内存总计: %d MB (限 %d MB)\n刷新间隔: %d ms",
+            "状态: %s (第 %d/%d 圈%s)%s\n动画: %s\n当前帧耗时: %.2f ms (限 %d ms)\n内存总计: %d MB (限 %d MB)\n刷新间隔: %d ms%s",
             s.stateName, s.currentPlayCount + 1, s.targetSelfPlay, frameText, warnSign,
+            s.animationDisplay.ifEmpty { "无" },
             s.drawTimeMs, s.limitDrawTime,
-            s.currentMemMb, s.limitMemory, s.frameIntervalMs
+            s.currentMemMb, s.limitMemory, s.frameIntervalMs,
+            sensorText
         )
 
         val maxWidth = canvas.width * 0.9f
@@ -121,14 +149,12 @@ class DebugOverlayRenderer {
             centerY + totalHeight / 2 + padding
         )
 
-        // 【修复】告警时用更深的背景（原 #99000000 比 #B3000000 更浅，观感反倒变淡）
         val oldColor = debugBgPaint.color
         if (s.isAlarm) debugBgPaint.color = Color.parseColor("#CC1A1A1A")
         canvas.drawRoundRect(rect, 20f, 20f, debugBgPaint)
         debugBgPaint.color = oldColor
 
         val startY = centerY - totalHeight / 2 + debugTextPaint.textSize
-        // 【修复】debugTextPaint 已是白色同尺寸，直接复用
         drawWrappedText(canvas, memoryText, debugTextPaint, centerX, startY, maxWidth)
     }
 
