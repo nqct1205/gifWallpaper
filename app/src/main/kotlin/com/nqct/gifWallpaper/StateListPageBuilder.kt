@@ -8,16 +8,11 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 
-/**
- * 状态列表页。
- *
- * 【展示】每个状态的“状态名 (id)”、引用动画的“动画名 (id)”、周期范围、转移规则数、是否默认。
- * 点击行进入编辑页；行内提供“设为默认”与“删除”。
- *
- * 【删除】由 [MainActivity.deleteState] 处理级联清理（转移规则、事件规则）。
- */
+// 状态列表页。骨架由 ListPageScaffold 提供，本类只负责数据源与 item 渲染。
+// 排序结果影响列表顺序与状态图布局顺序，不影响引用关系与默认状态。
 class StateListPageBuilder(
     private val activity: Activity,
     private val config: ProjectConfig,
@@ -30,59 +25,35 @@ class StateListPageBuilder(
         fun onEditState(stateId: String)
         fun onDeleteState(stateId: String)
         fun onSetDefault(stateId: String)
+        fun onReorderStates(fromIndex: Int, toIndex: Int)
     }
 
-    fun build(): View {
-        val root = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(40, 40, 40, 40)
-            setBackgroundColor(Color.parseColor("#F5F5F5"))
-        }
-
-        // ---- 顶栏 ----
-        val topBar = LinearLayout(activity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        topBar.addView(Button(activity).apply {
-            text = "< 返回"
-            setOnClickListener { callbacks.onBack() }
-        })
-        topBar.addView(TextView(activity).apply {
-            text = "状态管理"
-            textSize = 20f
-            setTypeface(null, Typeface.BOLD)
-            setPadding(20, 0, 0, 0)
-        })
-        root.addView(topBar)
-
-        // ---- 新建 ----
-        root.addView(Button(activity).apply {
-            text = "新建状态"
-            setBackgroundColor(Color.parseColor("#4CAF50"))
-            setTextColor(Color.WHITE)
-            setOnClickListener { callbacks.onCreateState() }
-        }, matchWrap(top = 20, bottom = 20))
-
-        // ---- 列表 ----
-        if (config.states.isEmpty()) {
-            root.addView(TextView(activity).apply {
-                text = "暂无状态，请先新建。\n注意：状态需要引用动画，请先在「动画」页面创建动画。"
-                textSize = 14f
-                setTextColor(Color.GRAY)
-                gravity = Gravity.CENTER
-                setPadding(0, 50, 0, 50)
-            })
-        } else {
-            for ((id, state) in config.states.toSortedMap()) {
-                root.addView(buildStateItem(id, state), matchWrap(bottom = 10))
+    fun build(scrollView: ScrollView): View {
+        return ListPageScaffold.build(
+            activity = activity,
+            scrollView = scrollView,
+            title = "状态管理",
+            actionText = "新建状态",
+            actionColor = Color.parseColor("#4CAF50"),
+            emptyText = "暂无状态，请先新建。\n注意：状态需要引用动画，请先在「动画」页面创建动画。",
+            onBack = { callbacks.onBack() },
+            onAction = { callbacks.onCreateState() },
+            itemCount = config.states.size,
+            bindItems = { column ->
+                val entries = config.states.entries.toList()
+                column.setItems(
+                    items = entries,
+                    scrollView = scrollView,
+                    itemBuilder = { entry, _, handle ->
+                        buildStateItem(entry.key, entry.value, handle)
+                    },
+                    onReorder = { from, to -> callbacks.onReorderStates(from, to) }
+                )
             }
-        }
-
-        return root
+        )
     }
 
-    private fun buildStateItem(id: String, state: StateNode): View {
+    private fun buildStateItem(id: String, state: StateNode, handle: View): View {
         val isDefault = (id == config.defaultStateId)
         val animDisplay = config.animations[state.animationId]
             ?.let { formatAnimDisplay(it) }
@@ -92,10 +63,13 @@ class StateListPageBuilder(
             orientation = LinearLayout.VERTICAL
             setPadding(20, 20, 20, 20)
             setBackgroundColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 10 }
             setOnClickListener { callbacks.onEditState(id) }
         }
 
-        // 标题行：名字 (id) + 默认标记
         val headerRow = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -118,9 +92,12 @@ class StateListPageBuilder(
                 ).apply { leftMargin = 10 }
             })
         }
+        headerRow.addView(View(activity).apply {
+            layoutParams = LinearLayout.LayoutParams(0, 1, 1f)
+        })
+        headerRow.addView(handle)
         card.addView(headerRow)
 
-        // 信息行
         card.addView(TextView(activity).apply {
             text = "动画: $animDisplay  |  周期: ${state.periodMin}~${state.periodMax} 圈  |  转移规则: ${state.rules.size}"
             textSize = 13f
@@ -128,7 +105,6 @@ class StateListPageBuilder(
             setPadding(0, 5, 0, 5)
         })
 
-        // 操作行
         val actionRow = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
         if (!isDefault) {
             actionRow.addView(Button(activity).apply {
@@ -149,9 +125,4 @@ class StateListPageBuilder(
 
         return card
     }
-
-    private fun matchWrap(top: Int = 0, bottom: Int = 0) = LinearLayout.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT,
-        ViewGroup.LayoutParams.WRAP_CONTENT
-    ).apply { setMargins(0, top, 0, bottom) }
 }

@@ -17,24 +17,7 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 
-/**
- * 状态编辑页。
- *
- * 【编辑内容】
- *  - 状态名称（可一键改为引用动画名）。
- *  - 引用的动画（下拉选择，显示“动画名 (id)”）。
- *  - 周期范围 min~max（圈数）。
- *  - 转移规则列表：每条包含目标状态（显示“状态名 (id)”） + 权重 + 百分比。
- *
- * 【就地修改】直接 mutate [StateNode]；返回或保存时由 [MainActivity] 持久化。
- *
- * 【ID 不可改】状态 ID 是转移规则 / 事件规则 / 默认状态的引用键，只读展示。
- * 名称（[StateNode.name]）可自由修改，仅用于展示。
- *
- * 【周期语义】进入该状态时从 min~max 随机抽取目标圈数，见 [PlaybackController]。
- *
- * 【权重百分比】任一行权重变化时，通过 [percentUpdaters] 列表让所有行同步刷新。
- */
+// 状态编辑页。
 class StateEditPageBuilder(
     private val activity: Activity,
     private val config: ProjectConfig,
@@ -57,7 +40,7 @@ class StateEditPageBuilder(
             setBackgroundColor(Color.parseColor("#F5F5F5"))
         }
 
-        // ---- 顶栏 ----
+        // 顶栏
         val topBar = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -74,13 +57,9 @@ class StateEditPageBuilder(
         })
         root.addView(topBar)
 
-        // ---- 名称（带一键重命名） ----
         root.addView(buildNameRow(state), matchWrap(top = 10, bottom = 10))
-
-        // ---- 动画选择 ----
         root.addView(buildAnimationSelector(state), matchWrap(bottom = 10))
 
-        // ---- 周期 ----
         root.addView(TextView(activity).apply {
             text = "周期（播放所引用动画的圈数范围）"
             textSize = 14f
@@ -88,7 +67,6 @@ class StateEditPageBuilder(
         })
         root.addView(buildPeriodRow(state), matchWrap(bottom = 10))
 
-        // ---- 转移规则 ----
         root.addView(TextView(activity).apply {
             text = "概率转移规则"
             textSize = 16f
@@ -99,12 +77,8 @@ class StateEditPageBuilder(
         val rulesContainer = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
         root.addView(rulesContainer)
 
-        // 每行注册一个"刷新自己百分比"的回调；权重变化时遍历所有回调更新
         val percentUpdaters = mutableListOf<() -> Unit>()
-
-        fun updateAllPercents() {
-            percentUpdaters.forEach { it() }
-        }
+        fun updateAllPercents() { percentUpdaters.forEach { it() } }
 
         fun refreshRules() {
             rulesContainer.removeAllViews()
@@ -128,7 +102,6 @@ class StateEditPageBuilder(
         }
         refreshRules()
 
-        // ---- 添加规则 ----
         root.addView(Button(activity).apply {
             text = "+ 添加转移规则"
             setOnClickListener {
@@ -142,7 +115,6 @@ class StateEditPageBuilder(
             }
         }, matchWrap(top = 10, bottom = 20))
 
-        // ---- 底部操作 ----
         root.addView(buildBottomBar())
 
         return root
@@ -150,13 +122,6 @@ class StateEditPageBuilder(
 
     // ==================== 名称行 ====================
 
-    /**
-     * 名称输入行 + “用动画名”按钮。
-     *
-     * 点击按钮后，状态名改为引用动画的名字（动画名字为空时用动画 id 回退）。
-     * 状态只引用一个动画，所以是"第一个也是唯一一个"。
-     * 若状态尚未引用任何动画，Toast 提示。
-     */
     private fun buildNameRow(state: StateNode): View {
         val row = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -166,10 +131,9 @@ class StateEditPageBuilder(
             text = "名称: "
             textSize = 14f
         })
-
         val etName = EditText(activity).apply {
             setText(state.name)
-            hint = state.id  // 空时以 ID 作为提示
+            hint = state.id
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             addTextChangedListener(object : SimpleTextWatcher() {
                 override fun afterTextChanged(s: Editable?) {
@@ -178,7 +142,6 @@ class StateEditPageBuilder(
             })
         }
         row.addView(etName)
-
         row.addView(Button(activity).apply {
             text = "用动画名"
             textSize = 12f
@@ -209,7 +172,8 @@ class StateEditPageBuilder(
             textSize = 14f
         })
 
-        val animIds = config.animations.keys.sorted()
+        // 顺序跟随用户排序
+        val animIds = config.animations.keys.toList()
         if (animIds.isEmpty()) {
             row.addView(TextView(activity).apply {
                 text = "（无可用动画，请先在「动画」页创建）"
@@ -219,7 +183,6 @@ class StateEditPageBuilder(
             return row
         }
 
-        // 显示格式化名，选中后用 animIds 索引取原始 ID
         val animDisplays = animIds.map { formatAnimDisplay(config.animations[it]) }
 
         val spinner = Spinner(activity).apply {
@@ -240,7 +203,6 @@ class StateEditPageBuilder(
             }
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
-        // 防御性：若 state 原本未引用动画或引用了不存在的动画，自动纠正
         if (config.animations[state.animationId] == null) {
             state.animationId = animIds.first()
         }
@@ -281,9 +243,6 @@ class StateEditPageBuilder(
         return row
     }
 
-    /**
-     * 单条转移规则行：目标状态 Spinner（显示状态名 (id)） + 权重输入 + 百分比 + 删除。
-     */
     private fun buildRuleRow(
         state: StateNode,
         rule: TransitionRule,
@@ -298,7 +257,6 @@ class StateEditPageBuilder(
             setBackgroundColor(Color.WHITE)
         }
 
-        // 第一行：目标状态选择
         val targetRow = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -308,7 +266,8 @@ class StateEditPageBuilder(
             textSize = 13f
         })
 
-        val allStateIds = config.states.keys.sorted()
+        // 顺序跟随用户排序
+        val allStateIds = config.states.keys.toList()
         if (allStateIds.isEmpty()) {
             targetRow.addView(TextView(activity).apply {
                 text = "（无状态）"
@@ -335,7 +294,6 @@ class StateEditPageBuilder(
                 }
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             }
-            // 防御性：目标状态失效时自动纠正
             if (config.states[rule.targetStateId] == null) {
                 rule.targetStateId = allStateIds.first()
             }
@@ -353,7 +311,6 @@ class StateEditPageBuilder(
         })
         card.addView(targetRow)
 
-        // 第二行：权重 + 百分比
         val weightRow = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -384,7 +341,6 @@ class StateEditPageBuilder(
         weightRow.addView(tvPercent)
         card.addView(weightRow)
 
-        // 注册本行的百分比刷新回调
         percentUpdaters.add {
             val total = state.rules.sumOf { it.weight.coerceAtLeast(0) }.coerceAtLeast(1)
             val pct = (rule.weight.toFloat() / total * 100f).toInt()

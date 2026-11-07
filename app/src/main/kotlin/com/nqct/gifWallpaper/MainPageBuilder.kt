@@ -39,7 +39,6 @@ class MainPageBuilder(
         fun onExportZip()
         fun onImportJson()
         fun onImportZip()
-        // 新增：导出调试日志
         fun onExportLog()
     }
 
@@ -285,7 +284,7 @@ class MainPageBuilder(
         root.addView(buildNumberInputRow("渲染耗时上限: ", " ms", "limitDraw", 20))
         root.addView(buildNumberInputRow("内存占用上限: ", " MB", "limitMem", 150))
 
-        // 日志导出
+        // 日志查看入口（进入分类导出页）
         root.addView(TextView(activity).apply {
             text = "调试日志"
             textSize = 14f
@@ -293,11 +292,11 @@ class MainPageBuilder(
             setPadding(0, 20, 0, 5)
         })
         root.addView(Button(activity).apply {
-            text = "导出日志（${LogBuffer.size()} 条）"
+            text = "查看与导出日志（${LogBuffer.sizeGeneral() + LogBuffer.sizePerf() + LogBuffer.sizeError()} 条）"
             setOnClickListener { callbacks.onExportLog() }
         }, matchWrapWithMargins(bottom = 5))
         root.addView(TextView(activity).apply {
-            text = "导出后可分享或保存。包含状态切换、传感器、异常等调试信息，便于排查问题。"
+            text = "按普通 / 性能 / 错误分类导出，便于排查问题。"
             textSize = 11f
             setTextColor(Color.GRAY)
             setPadding(0, 0, 0, 10)

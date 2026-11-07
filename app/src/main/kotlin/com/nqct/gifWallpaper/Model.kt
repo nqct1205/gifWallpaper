@@ -7,7 +7,6 @@ package com.nqct.gifWallpaper
 // ==================== 资源层 ====================
 
 // 磁盘上的 GIF 静态资源。所有字段由文件决定，用户不可修改。
-// 播放时的定位/缩放属于 AnimationResourceRef，不属于本类。
 data class ResourceItem(
     val id: String,
     val fileName: String,
@@ -16,8 +15,6 @@ data class ResourceItem(
 
 // ==================== 9 点定位 ====================
 
-// GIF 资源上的 9 个锚点，作为平移目标点与缩放中心。
-// 归一化坐标：(0,0) 左上，(1,1) 右下。
 enum class AnchorPoint(val label: String) {
     TOP_LEFT("左上"),
     TOP_CENTER("上中"),
@@ -44,19 +41,13 @@ enum class AnchorPoint(val label: String) {
 
 // ==================== 缩放模式 ====================
 
-// PERCENT：scaleValue 是相对原始尺寸的百分比（100 = 原始大小）。
-// PIXEL：scaleValue 是目标宽度像素，高度按原始宽高比换算。
 enum class ScaleMode { PERCENT, PIXEL }
 
 // ==================== 动画内的资源引用 ====================
 
-// 定位/缩放是动画的属性，不是资源的属性。
-// 同一资源可被不同动画以不同定位/缩放引用。
 data class AnimationResourceRef(
     var resourceId: String = "",
-    // GIF 上的锚点：决定 GIF 的哪个点参与对齐 / 缩放中心
     var anchor: AnchorPoint = AnchorPoint.CENTER,
-    // 屏幕目标锚点：决定 GIF 的 anchor 对齐到屏幕的哪个位置
     var targetAnchor: AnchorPoint = AnchorPoint.CENTER,
     var scaleMode: ScaleMode = ScaleMode.PERCENT,
     var scaleValue: Float = 100f,
@@ -67,11 +58,6 @@ data class AnimationResourceRef(
 // ==================== 动画层 ====================
 
 // 动画项：一组资源引用。
-// 当前简化：同一动画内多个资源同时开始、同时绘制，以第一个资源（主实例）的
-// onAnimationEnd 作为一圈结束信号；各资源长度不一致时按最短者计。
-// 后续可改为手动帧索引控制（共享解码数据，各自控制进度）。
-//
-// name：用户可编辑，展示时优先使用；为空时回退到 id。
 // backgroundColor：十六进制字符串（#RRGGBB 或 #AARRGGBB）；空串 = 不自定义，回退黑色。
 data class AnimationItem(
     var id: String = "",
@@ -82,7 +68,6 @@ data class AnimationItem(
 
 // ==================== 状态与转移规则 ====================
 
-// 按权重随机转移的规则。weight = 0 表示不会被抽到。
 data class TransitionRule(
     var targetStateId: String = "",
     var weight: Int = 1
@@ -90,7 +75,6 @@ data class TransitionRule(
 
 // 状态节点：引用一个动画 + 周期范围 + 概率转移规则。
 // id 不可改（引用键）；name 用户可编辑，仅展示用。
-// 周期 = 进入状态时从 [periodMin, periodMax] 随机抽取的目标圈数。
 data class StateNode(
     var id: String = "",
     var name: String = "",
@@ -102,19 +86,6 @@ data class StateNode(
 
 // ==================== 设备方向 ====================
 
-// 手机在空间中的 6 个朝向，外加未知/临界状态。
-// 基于重力在设备坐标系的归一化分量判定：
-//   平放：|gz| > 0.7
-//   竖持：|gz| <= 0.7 且 |gy| > 0.7
-//   横持：|gz| <= 0.7 且 |gy| <= 0.7 且 |gx| > 0.7
-//   否则 UNKNOWN（临界/斜握）
-// 物理含义：
-//   SCREEN_UP      屏幕朝上（正面朝上）
-//   SCREEN_DOWN    屏幕朝下（背面朝上）
-//   PORTRAIT       竖屏（顶部朝上）
-//   PORTRAIT_REVERSED 竖屏倒置（顶部朝下）
-//   LANDSCAPE_LEFT 横屏（顶部朝左）
-//   LANDSCAPE_RIGHT 横屏（顶部朝右）
 enum class DeviceOrientation(val label: String) {
     SCREEN_UP("屏幕朝上"),
     SCREEN_DOWN("屏幕朝下"),
@@ -127,7 +98,6 @@ enum class DeviceOrientation(val label: String) {
 
 // ==================== 事件规则 ====================
 
-// 支持的外部事件类型。
 enum class EventType(val label: String) {
     ORIENTATION("手机方向改变"),
     SHAKE("摇一摇"),
@@ -135,29 +105,14 @@ enum class EventType(val label: String) {
 }
 
 // 附加条件：事件触发瞬间需满足的快照条件。
-// 当前仅支持 ORIENTATION 类型（param = DeviceOrientation.name）；
-// 结构上为未来扩展预留（如电量、时间、当前状态等）。
+// 当前仅支持 ORIENTATION（param = DeviceOrientation.name），结构为未来扩展预留。
 data class EventCondition(
     var type: EventType = EventType.ORIENTATION,
     var param: String = ""
 )
 
 // 事件驱动规则。
-//
-// 匹配流程：
-//   1. 主事件（type + triggerParam）匹配
-//   2. 当前状态在 sourceStateIds 中（空 = 任意状态）
-//   3. 所有 conditions 在当前快照下满足
-//   全部通过则跳转到 targetStateId。
-//
-// triggerParam：
-//   - ORIENTATION: DeviceOrientation.name（如 "PORTRAIT"），语义为"变为该方向"
-//   - SHAKE / CLICK: 忽略
-//
-// conditions：附加条件列表，每项独立判定（AND 关系）。
-// 当前仅支持方向条件：param = DeviceOrientation.name，比较"事件触发瞬间的方向"。
-//
-// 后续可扩展：为规则增加概率 / 多目标，实现"按概率跳不同状态或干脆不跳"。
+// 匹配流程：主事件匹配 -> 当前状态在 sourceStateIds -> 所有 conditions 满足 -> 跳转。
 data class EventRule(
     var id: String = "",
     var type: EventType = EventType.ORIENTATION,
@@ -169,8 +124,6 @@ data class EventRule(
 
 // ==================== 项目总配置 ====================
 
-// 项目根配置，所有子表按 id 索引。
-// 持久化到 filesDir/project.json；ResourceItem.info 是解析缓存，不写入 JSON。
 class ProjectConfig {
     var defaultStateId: String = ""
     val resources = mutableMapOf<String, ResourceItem>()
@@ -213,5 +166,36 @@ class ProjectConfig {
             }
         }
         return issues
+    }
+
+    // ==================== 重排 ====================
+    // 用于拖动排序。索引语义：toIndex 是"最终位置"（原数组视角）。
+    // 内部先移除再插入，LinkedHashMap 保持插入顺序。
+
+    fun reorderResources(from: Int, to: Int) {
+        val list = resources.entries.toMutableList()
+        if (from !in list.indices || to !in list.indices || from == to) return
+        val item = list.removeAt(from)
+        list.add(to, item)
+        resources.clear()
+        for ((k, v) in list) resources[k] = v
+    }
+
+    fun reorderAnimations(from: Int, to: Int) {
+        val list = animations.entries.toMutableList()
+        if (from !in list.indices || to !in list.indices || from == to) return
+        val item = list.removeAt(from)
+        list.add(to, item)
+        animations.clear()
+        for ((k, v) in list) animations[k] = v
+    }
+
+    fun reorderStates(from: Int, to: Int) {
+        val list = states.entries.toMutableList()
+        if (from !in list.indices || to !in list.indices || from == to) return
+        val item = list.removeAt(from)
+        list.add(to, item)
+        states.clear()
+        for ((k, v) in list) states[k] = v
     }
 }

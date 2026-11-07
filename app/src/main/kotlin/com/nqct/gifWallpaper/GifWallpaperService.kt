@@ -28,17 +28,17 @@ import java.io.File
 //   - GifDrawable 由 start() 自己推进帧，不做每帧 seek（避免卡顿）。
 //   - 状态切换由定时器驱动（时长 = GifDrawable.duration 一圈）。
 //   - 切换时：旧 AnimRuntime.stop() → 新 AnimRuntime.reset()（seekToFrame(0)）→ start()
-//     这一次 seek 就根治了"闪最后一帧"。
 //
 // 【内存策略】全量预加载 + trim 时释放非当前。
-//   系统内存告急（TRIM_MEMORY_MODERATE 及以上）时释放当前状态未引用的动画实例。
-//   之后状态机切到被释放的动画时，enterState 检测到 cache miss，自动异步重载：
-//     - 重载期间 currentRuntime = null，调试面板显示"正在重新加载"提示（约 5 秒）
+//   trim 释放后切回时，enterState 检测 cache miss，自动异步重载：
+//     - 重载期间调试面板显示"正在重新加载"提示（约 5 秒）
 //     - 重载完成后加入 cache，若当前状态仍是原 stateId 则立即激活
 //     - 重载失败时显示"重新加载失败"提示（约 8 秒），并写错误日志
-//   这是有意的取舍：多数时候内存充足不会触发 trim；触发时通过重载保证功能正确。
 //
-// 【日志】关键事件写入 LogBuffer，可在 App 主页导出。
+// 【日志】
+//   - 普通（i / w）：状态切换、传感器、生命周期、用户操作
+//   - 性能（perf）：帧耗时超限、内存超限、卡顿、切换/重载耗时
+//   - 错误（e）：异常、加载/重载失败
 class GifWallpaperService : WallpaperService() {
 
     @Volatile private var currentEngine: GifEngine? = null
@@ -360,6 +360,7 @@ class GifWallpaperService : WallpaperService() {
         // ==================== 状态切换 ====================
 
         private fun enterState(stateId: String, reason: String) {
+            val t0 = SystemClock.elapsedRealtime()
             enterStateCount++
             cancelCycleTimer()
             currentRuntime?.stop()
@@ -394,18 +395,14 @@ class GifWallpaperService : WallpaperService() {
             if (prevId != stateId) {
                 LogBuffer.i("状态切换: ${prevId.ifEmpty { "(初始)" }} -> $stateId ($reason)")
             }
+
+            val cost = SystemClock.elapsedRealtime() - t0
+            if (cost > 50) {
+                LogBuffer.perf("状态切换耗时 ${cost}ms: ${prevId.ifEmpty { "(初始)" }} -> $stateId")
+            }
         }
 
         // 异步重载指定动画。完成后若当前状态仍为 stateId，则激活。
-        //
-        // 重载期间：
-        //   - currentRuntime 保持 null，调试面板显示"正在重新加载"提示
-        //   - 不安排周期定时器（避免空 runtime 触发状态机切换）
-        //
-        // 重载完成后：
-        //   - 动画加入 animRuntimeCache
-        //   - 若 currentRenderStateId == stateId：激活（reset + start + scheduleCycleTimer）
-        //   - 否则只放缓存，等状态机自然切回
         private fun startReloadAnimation(animId: String, stateId: String) {
             if (pendingReloadAnimId == animId) {
                 LogBuffer.d("已有相同动画在重载中: $animId")
@@ -414,6 +411,7 @@ class GifWallpaperService : WallpaperService() {
             pendingReloadAnimId = animId
             pendingReloadStateId = stateId
             val gen = ++pendingReloadGen
+            val startMs = SystemClock.elapsedRealtime()
 
             setInfoMessage("⟳ 正在重新加载动画: $animId", 5000L)
             LogBuffer.w("动画被系统释放，开始异步重载: $animId")
@@ -434,17 +432,21 @@ class GifWallpaperService : WallpaperService() {
                     if (destroyed || gen != pendingReloadGen) return@post
                     pendingReloadAnimId = null
                     pendingReloadStateId = null
+                    val cost = SystemClock.elapsedRealtime() - startMs
 
                     val ok = instances.isNotEmpty() && instances.any { it.gifDrawable != null }
                     if (!ok) {
                         setInfoMessage("✗ 重新加载失败: $animId", 8000L)
-                        LogBuffer.e("动画重新加载失败: $animId")
+                        LogBuffer.e("动画重新加载失败: $animId (耗时 ${cost}ms)")
                         return@post
                     }
 
                     val runtime = AnimRuntime(animId, instances)
                     animRuntimeCache[animId] = runtime
-                    LogBuffer.i("动画重新加载完成: $animId (${runtime.allocationBytes / 1024 / 1024}MB)")
+                    LogBuffer.i("动画重新加载完成: $animId (${runtime.allocationBytes / 1024 / 1024}MB, 耗时 ${cost}ms)")
+                    if (cost > 100) {
+                        LogBuffer.perf("重载耗时较长 ${cost}ms: $animId")
+                    }
 
                     // 如果当前状态还是原 stateId，激活
                     if (currentRenderStateId == stateId) {
@@ -456,7 +458,6 @@ class GifWallpaperService : WallpaperService() {
                         lastFrameTime = 0L
                         scheduleCycleTimer()
                     } else {
-                        // 用户已切走，只更新提示
                         setInfoMessage("✓ 已重新加载: $animId（当前已切走）", 3000L)
                     }
                 }
@@ -481,6 +482,7 @@ class GifWallpaperService : WallpaperService() {
                 if (nextId != currentRenderStateId) {
                     enterState(nextId, "周期完成")
                 } else {
+                    // 原地重播：reset 从第一帧开始，不切换状态
                     currentRuntime?.reset()
                     currentRuntime?.start()
                     scheduleCycleTimer()
@@ -632,16 +634,25 @@ class GifWallpaperService : WallpaperService() {
             frameIntervalMs = deltaMs
             lastFrameTime = now
 
+            // 卡顿检测：帧间隔超过 100ms 视为异常
+            if (deltaMs > 100) {
+                LogBuffer.perf("卡顿: 帧间隔 ${deltaMs}ms, state=$currentRenderStateId")
+            }
+
             if (now - lastMemoryUpdateTime > 1000) {
                 Debug.getMemoryInfo(memInfo)
                 currentMemMb = memInfo.totalPss / 1024
                 val warmup = (now - engineStartTime) < 3000
                 if (!warmup && loadErrorMsg.isEmpty() && currentMemMb > limitMemory) {
                     forceShowDebug = true
+                    LogBuffer.perf(
+                        "内存超限: ${currentMemMb}MB > ${limitMemory}MB, state=$currentRenderStateId"
+                    )
                 }
                 lastMemoryUpdateTime = now
             }
 
+            // 周期性状态摘要日志（每 5 秒一次，避免刷屏）
             if (now - lastStatusLogTime > 5000) {
                 lastStatusLogTime = now
                 val rt = currentRuntime
@@ -700,6 +711,9 @@ class GifWallpaperService : WallpaperService() {
                     val warmup = (now - engineStartTime) < 3000
                     if (!warmup && loadErrorMsg.isEmpty() && drawTimeMs > limitDrawTime) {
                         forceShowDebug = true
+                        LogBuffer.perf(
+                            "帧耗时超限: ${"%.1f".format(drawTimeMs)}ms > ${limitDrawTime}ms, state=$currentRenderStateId"
+                        )
                     }
                     try { holder.unlockCanvasAndPost(canvas) } catch (_: Exception) {}
                 }

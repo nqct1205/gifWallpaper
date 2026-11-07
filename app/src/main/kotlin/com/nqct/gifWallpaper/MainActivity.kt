@@ -45,6 +45,7 @@ class MainActivity : Activity() {
             val returnTo: Page = EventRuleList
         ) : Page()
         object StateGraph : Page()
+        object LogExport : Page()
     }
 
     companion object {
@@ -53,11 +54,16 @@ class MainActivity : Activity() {
         private const val REQ_EXPORT_ZIP = 202
         private const val REQ_IMPORT_JSON = 203
         private const val REQ_IMPORT_ZIP = 204
-        private const val REQ_EXPORT_LOG = 205
+        private const val REQ_EXPORT_LOG_GENERAL = 205
+        private const val REQ_EXPORT_LOG_PERF = 206
+        private const val REQ_EXPORT_LOG_ERROR = 207
+        private const val REQ_EXPORT_LOG_ALL = 208
 
         private const val ZIP_ENTRY_CONFIG = ProjectConfigStore.CONFIG_FILE
         private const val ZIP_ENTRY_ANIM_DIR = ProjectConfigStore.ANIM_DIR
     }
+
+    // ==================== 生命周期 ====================
 
     override fun onCreate(savedInstanceState: Bundle?) {
         requestWindowFeature(Window.FEATURE_NO_TITLE)
@@ -99,6 +105,7 @@ class MainActivity : Activity() {
             is Page.Main -> null
             is Page.StateEdit -> cur.returnTo
             is Page.EventRuleEdit -> cur.returnTo
+            is Page.LogExport -> Page.Main
             else -> Page.Main
         }
         if (back == null) {
@@ -115,6 +122,8 @@ class MainActivity : Activity() {
             showPage(back)
         }
     }
+
+    // ==================== 配置加载 / 保存 ====================
 
     private fun loadConfig() {
         when (val r = ProjectConfigStore.load(this)) {
@@ -138,24 +147,32 @@ class MainActivity : Activity() {
         return ok
     }
 
+    // ==================== 页面路由 ====================
+
     private fun showPage(page: Page) {
         currentPage = page
-        val content = when (page) {
+
+        // 状态图：全屏，不包 ScrollView
+        if (page is Page.StateGraph) {
+            setContentView(buildStateGraphPage())
+            return
+        }
+
+        val scrollView = ScrollView(this)
+        val content: android.view.View = when (page) {
             is Page.Main -> buildMainPage()
-            is Page.ResourceList -> buildResourceListPage()
-            is Page.AnimationList -> buildAnimationListPage()
+            is Page.ResourceList -> buildResourceListPage(scrollView)
+            is Page.AnimationList -> buildAnimationListPage(scrollView)
             is Page.AnimationEdit -> buildAnimationEditPage(page.animationId)
-            is Page.StateList -> buildStateListPage()
+            is Page.StateList -> buildStateListPage(scrollView)
             is Page.StateEdit -> buildStateEditPage(page)
             is Page.EventRuleList -> buildEventRuleListPage()
             is Page.EventRuleEdit -> buildEventRuleEditPage(page)
-            is Page.StateGraph -> buildStateGraphPage()
+            is Page.LogExport -> buildLogExportPage()
+            is Page.StateGraph -> error("unreachable")
         }
-        if (page is Page.StateGraph) {
-            setContentView(content)
-        } else {
-            setContentView(ScrollView(this).apply { addView(content) })
-        }
+        scrollView.addView(content)
+        setContentView(scrollView)
     }
 
     private fun buildMainPage(): android.view.View = MainPageBuilder(
@@ -175,21 +192,42 @@ class MainActivity : Activity() {
             override fun onExportZip() { startExportZip() }
             override fun onImportJson() { confirmImport("导入 JSON") { startImportJson() } }
             override fun onImportZip() { confirmImport("导入压缩包") { startImportZip() } }
-            override fun onExportLog() { startExportLog() }
+            override fun onExportLog() { showPage(Page.LogExport) }
         }
     ).build()
 
-    private fun buildResourceListPage() = ResourceListPageBuilder(
+    private fun buildLogExportPage(): android.view.View = LogExportPageBuilder(
+        activity = this,
+        callbacks = object : LogExportPageBuilder.Callbacks {
+            override fun onBack() { showPage(Page.Main) }
+            override fun onExportGeneral() { startExportLog(REQ_EXPORT_LOG_GENERAL, "general") }
+            override fun onExportPerf() { startExportLog(REQ_EXPORT_LOG_PERF, "perf") }
+            override fun onExportError() { startExportLog(REQ_EXPORT_LOG_ERROR, "error") }
+            override fun onExportAll() { startExportLog(REQ_EXPORT_LOG_ALL, "all") }
+            override fun onClearLogs() {
+                Toast.makeText(this@MainActivity, "已清空", Toast.LENGTH_SHORT).show()
+                showPage(Page.LogExport)
+            }
+        }
+    ).build()
+
+    private fun buildResourceListPage(scrollView: ScrollView) = ResourceListPageBuilder(
         activity = this,
         config = config,
         callbacks = object : ResourceListPageBuilder.Callbacks {
             override fun onBack() { showPage(Page.Main) }
             override fun onImportGif() { selectGif() }
             override fun onDeleteResource(resourceId: String) { deleteResource(resourceId) }
+            override fun onReorderResources(fromIndex: Int, toIndex: Int) {
+                config.reorderResources(fromIndex, toIndex)
+                saveConfig()
+                showPage(Page.ResourceList)
+                LogBuffer.i("资源排序: $fromIndex -> $toIndex")
+            }
         }
-    ).build()
+    ).build(scrollView)
 
-    private fun buildAnimationListPage() = AnimationListPageBuilder(
+    private fun buildAnimationListPage(scrollView: ScrollView) = AnimationListPageBuilder(
         activity = this,
         config = config,
         callbacks = object : AnimationListPageBuilder.Callbacks {
@@ -197,8 +235,36 @@ class MainActivity : Activity() {
             override fun onCreateAnimation() { createNewAnimation() }
             override fun onEditAnimation(animationId: String) { showPage(Page.AnimationEdit(animationId)) }
             override fun onDeleteAnimation(animationId: String) { deleteAnimation(animationId) }
+            override fun onReorderAnimations(fromIndex: Int, toIndex: Int) {
+                config.reorderAnimations(fromIndex, toIndex)
+                saveConfig()
+                showPage(Page.AnimationList)
+                LogBuffer.i("动画排序: $fromIndex -> $toIndex")
+            }
         }
-    ).build()
+    ).build(scrollView)
+
+    private fun buildStateListPage(scrollView: ScrollView) = StateListPageBuilder(
+        activity = this,
+        config = config,
+        callbacks = object : StateListPageBuilder.Callbacks {
+            override fun onBack() { showPage(Page.Main) }
+            override fun onCreateState() { createNewState() }
+            override fun onEditState(stateId: String) { showPage(Page.StateEdit(stateId)) }
+            override fun onDeleteState(stateId: String) { deleteState(stateId) }
+            override fun onSetDefault(stateId: String) {
+                config.defaultStateId = stateId
+                saveConfig()
+                showPage(Page.StateList)
+            }
+            override fun onReorderStates(fromIndex: Int, toIndex: Int) {
+                config.reorderStates(fromIndex, toIndex)
+                saveConfig()
+                showPage(Page.StateList)
+                LogBuffer.i("状态排序: $fromIndex -> $toIndex")
+            }
+        }
+    ).build(scrollView)
 
     private fun buildAnimationEditPage(animationId: String) = AnimationEditPageBuilder(
         activity = this,
@@ -213,22 +279,6 @@ class MainActivity : Activity() {
                 if (saveConfig()) showPage(Page.AnimationList)
             }
             override fun onDelete() { deleteAnimation(animationId) }
-        }
-    ).build()
-
-    private fun buildStateListPage() = StateListPageBuilder(
-        activity = this,
-        config = config,
-        callbacks = object : StateListPageBuilder.Callbacks {
-            override fun onBack() { showPage(Page.Main) }
-            override fun onCreateState() { createNewState() }
-            override fun onEditState(stateId: String) { showPage(Page.StateEdit(stateId)) }
-            override fun onDeleteState(stateId: String) { deleteState(stateId) }
-            override fun onSetDefault(stateId: String) {
-                config.defaultStateId = stateId
-                saveConfig()
-                showPage(Page.StateList)
-            }
         }
     ).build()
 
@@ -291,6 +341,36 @@ class MainActivity : Activity() {
         }
     ).build()
 
+    // ==================== 日志导出 ====================
+
+    private fun startExportLog(requestCode: Int, category: String) {
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TITLE, "gifwp_log_${category}_$ts.txt")
+        }
+        startActivityForResult(intent, requestCode)
+    }
+
+    private fun exportLogTo(uri: Uri, category: String) {
+        try {
+            val content = when (category) {
+                "general" -> LogBuffer.dumpGeneral()
+                "perf" -> LogBuffer.dumpPerf()
+                "error" -> LogBuffer.dumpError()
+                else -> LogBuffer.dumpAll()
+            }
+            contentResolver.openOutputStream(uri)?.use { output ->
+                output.write(content.toByteArray(Charsets.UTF_8))
+            } ?: throw IllegalStateException("无法写入目标文件")
+            Toast.makeText(this, "日志已导出", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "导出失败: ${e.message}", Toast.LENGTH_SHORT).show()
+            LogBuffer.e("日志导出失败", e)
+        }
+    }
+
     // ==================== 数据备份：导出 ====================
 
     private fun startExportJson() {
@@ -311,16 +391,6 @@ class MainActivity : Activity() {
             putExtra(Intent.EXTRA_TITLE, "gif_wallpaper_backup.zip")
         }
         startActivityForResult(intent, REQ_EXPORT_ZIP)
-    }
-
-    private fun startExportLog() {
-        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "text/plain"
-            putExtra(Intent.EXTRA_TITLE, "gifwp_log_$ts.txt")
-        }
-        startActivityForResult(intent, REQ_EXPORT_LOG)
     }
 
     private fun exportJsonTo(uri: Uri) {
@@ -363,19 +433,6 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             Toast.makeText(this, "导出失败: ${e.message}", Toast.LENGTH_SHORT).show()
             LogBuffer.e("压缩包导出失败", e)
-        }
-    }
-
-    private fun exportLogTo(uri: Uri) {
-        try {
-            contentResolver.openOutputStream(uri)?.use { output ->
-                val log = LogBuffer.dump()
-                output.write(log.toByteArray(Charsets.UTF_8))
-            } ?: throw IllegalStateException("无法写入目标文件")
-            Toast.makeText(this, "日志已导出", Toast.LENGTH_SHORT).show()
-        } catch (e: Exception) {
-            Toast.makeText(this, "导出失败: ${e.message}", Toast.LENGTH_SHORT).show()
-            LogBuffer.e("日志导出失败", e)
         }
     }
 
@@ -567,7 +624,10 @@ class MainActivity : Activity() {
             REQ_EXPORT_ZIP -> exportZipTo(uri)
             REQ_IMPORT_JSON -> importJsonFrom(uri)
             REQ_IMPORT_ZIP -> importZipFrom(uri)
-            REQ_EXPORT_LOG -> exportLogTo(uri)
+            REQ_EXPORT_LOG_GENERAL -> exportLogTo(uri, "general")
+            REQ_EXPORT_LOG_PERF -> exportLogTo(uri, "perf")
+            REQ_EXPORT_LOG_ERROR -> exportLogTo(uri, "error")
+            REQ_EXPORT_LOG_ALL -> exportLogTo(uri, "all")
         }
     }
 
@@ -714,7 +774,8 @@ class MainActivity : Activity() {
             Toast.makeText(this, "还没有任何状态", Toast.LENGTH_SHORT).show()
             return
         }
-        val ids = config.states.keys.sorted().toTypedArray()
+        // 顺序跟随用户排序
+        val ids = config.states.keys.toTypedArray()
         val displays = ids.map { formatStateDisplay(config.states[it]) }.toTypedArray()
         val currentIdx = ids.indexOf(config.defaultStateId).coerceAtLeast(0)
         AlertDialog.Builder(this)

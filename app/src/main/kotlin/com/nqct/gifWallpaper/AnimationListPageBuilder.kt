@@ -8,17 +8,10 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 
-/**
- * 动画列表页。
- *
- * 【展示】标题显示“动画名 (id)”；信息行显示资源引用数、被状态引用数。
- * 点击行进入编辑页；行内提供删除按钮。
- *
- * 【删除约束】被状态引用的动画**不允许删除**（提示先改状态）。
- * 由 [MainActivity.deleteAnimation] 实现，本页只负责触发。
- */
+// 动画列表页。骨架由 ListPageScaffold 提供，本类只负责数据源与 item 渲染。
 class AnimationListPageBuilder(
     private val activity: Activity,
     private val config: ProjectConfig,
@@ -30,65 +23,45 @@ class AnimationListPageBuilder(
         fun onCreateAnimation()
         fun onEditAnimation(animationId: String)
         fun onDeleteAnimation(animationId: String)
+        fun onReorderAnimations(fromIndex: Int, toIndex: Int)
     }
 
-    fun build(): View {
-        val root = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(40, 40, 40, 40)
-            setBackgroundColor(Color.parseColor("#F5F5F5"))
-        }
-
-        // ---- 顶栏 ----
-        val topBar = LinearLayout(activity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        topBar.addView(Button(activity).apply {
-            text = "< 返回"
-            setOnClickListener { callbacks.onBack() }
-        })
-        topBar.addView(TextView(activity).apply {
-            text = "动画管理"
-            textSize = 20f
-            setTypeface(null, Typeface.BOLD)
-            setPadding(20, 0, 0, 0)
-        })
-        root.addView(topBar)
-
-        // ---- 新建按钮 ----
-        root.addView(Button(activity).apply {
-            text = "新建动画"
-            setBackgroundColor(Color.parseColor("#4CAF50"))
-            setTextColor(Color.WHITE)
-            setOnClickListener { callbacks.onCreateAnimation() }
-        }, matchWrap(top = 20, bottom = 20))
-
-        // ---- 列表 ----
-        if (config.animations.isEmpty()) {
-            root.addView(TextView(activity).apply {
-                text = "暂无动画，请先新建。"
-                textSize = 14f
-                setTextColor(Color.GRAY)
-                gravity = Gravity.CENTER
-                setPadding(0, 50, 0, 50)
-            })
-        } else {
-            for ((id, anim) in config.animations.toSortedMap()) {
-                root.addView(buildAnimationItem(id, anim), matchWrap(bottom = 10))
+    fun build(scrollView: ScrollView): View {
+        return ListPageScaffold.build(
+            activity = activity,
+            scrollView = scrollView,
+            title = "动画管理",
+            actionText = "新建动画",
+            actionColor = Color.parseColor("#4CAF50"),
+            emptyText = "暂无动画，请先新建。",
+            onBack = { callbacks.onBack() },
+            onAction = { callbacks.onCreateAnimation() },
+            itemCount = config.animations.size,
+            bindItems = { column ->
+                val entries = config.animations.entries.toList()
+                column.setItems(
+                    items = entries,
+                    scrollView = scrollView,
+                    itemBuilder = { entry, _, handle ->
+                        buildAnimationItem(entry.key, entry.value, handle)
+                    },
+                    onReorder = { from, to -> callbacks.onReorderAnimations(from, to) }
+                )
             }
-        }
-
-        return root
+        )
     }
 
-    private fun buildAnimationItem(id: String, anim: AnimationItem): View {
+    private fun buildAnimationItem(id: String, anim: AnimationItem, handle: View): View {
         val usedByStates = config.states.values.count { it.animationId == id }
 
         val card = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(20, 20, 20, 20)
             setBackgroundColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 10 }
             setOnClickListener { callbacks.onEditAnimation(id) }
         }
 
@@ -97,7 +70,6 @@ class AnimationListPageBuilder(
             gravity = Gravity.CENTER_VERTICAL
         }
         headerRow.addView(TextView(activity).apply {
-            // 标题：名字 (id)，名字为空或等于 id 时仅显示 id
             text = formatAnimDisplay(anim)
             textSize = 16f
             setTypeface(null, Typeface.BOLD)
@@ -108,10 +80,10 @@ class AnimationListPageBuilder(
             setTextColor(Color.RED)
             setOnClickListener { callbacks.onDeleteAnimation(id) }
         })
+        headerRow.addView(handle)
         card.addView(headerRow)
 
         card.addView(TextView(activity).apply {
-            // 标题已含 id，信息行只放资源引用数 / 被引用数
             text = buildString {
                 append("资源引用: ${anim.resources.size}")
                 if (anim.backgroundColor.isNotBlank()) append("  |  背景色: ${anim.backgroundColor}")
@@ -124,9 +96,4 @@ class AnimationListPageBuilder(
 
         return card
     }
-
-    private fun matchWrap(top: Int = 0, bottom: Int = 0) = LinearLayout.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT,
-        ViewGroup.LayoutParams.WRAP_CONTENT
-    ).apply { setMargins(0, top, 0, bottom) }
 }

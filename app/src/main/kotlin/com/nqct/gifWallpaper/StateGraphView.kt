@@ -20,33 +20,18 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-/**
- * 状态图自定义 View。
- *
- * 【职责】把状态机可视化为可拖动/缩放的关系图：
- *  - 圆形布局：状态按数量均分在圆周上。
- *  - 节点：圆角矩形，显示 状态名 / 动画名 / 周期。
- *  - 转移箭头：从起点中心到终点中心，**箭头固定在连线的正中点**，概率标签放在箭头旁。
- *    节点在箭头之后绘制，覆盖线段两端，视觉上形成"节点到节点"的连接，无需计算边界交点。
- *  - 双向边：同时存在 A→B 与 B→A 时，两条线各向垂直方向偏移一侧，避免重叠。
- *  - 自环：圆心固定在节点**左上角顶点**，半径较小、颜色较浅。圆完整绘制，
- *    右下 1/4 被节点覆盖后形成圆弧。箭头放在数学 135°（屏幕左上）位置的圆上，
- *    方向为切线方向（数学 225°，屏幕左下）。概率标签沿 135° 方向外移，避免压住箭头。
- *  - 默认状态：绿色边框 + 浅绿背景高亮。
- *  - 事件高亮：设置 [highlightedEventRule] 后隐藏所有周期箭头，只画该事件相关的橙色虚线箭头。
- *
- * 【手势】
- *  - 单指拖动：平移。
- *  - 双指：缩放（0.3x ~ 3x），围绕双指焦点。
- *  - 单击空白（无节点）：若有事件高亮则清除，否则无动作。
- *  - 双击节点：触发 [onNodeDoubleTap]。
- *
- * 【坐标系统】所有几何尺寸在世界坐标下固定（节点宽高、布局半径等）；
- * 绘制时统一通过 Canvas 平移 + 缩放。线宽 / 箭头 / 文字标签则按 1/scale 反算，
- * 保证在不同缩放级别下视觉粗细和大小保持稳定。
- *
- * 【当前状态说明】本 View 只反映"配置"，不显示运行时正在播放的状态。
- */
+// 状态图自定义 View。
+//
+// 【布局】节点按状态数均分在圆周上。半径 R = max(240, 240 / sin(π/n))，
+//   相邻弦长恒为 480，保证 n 从 2 到 15 之间相邻节点间距足够。
+//
+// 【颜色】莫兰迪低饱和多色方案。预设 12 色，按状态顺序取；
+//   状态数 > 12 时用黄金角动态生成（饱和度 18%~30%，明度 62%~73%）。
+//
+// 【概率标签】无背景衬托。位置在箭头的尾巴（沿线段方向往起点一侧偏移），
+//   文字颜色为源色加深（×0.55），确保压在线段上仍清晰可读。
+//
+// 【手势】单指拖动、双指缩放、单击空白清高亮、双击节点跳编辑。
 class StateGraphView(context: Context) : View(context) {
 
     // ==================== 数据 ====================
@@ -54,7 +39,6 @@ class StateGraphView(context: Context) : View(context) {
     private var animations: Map<String, AnimationItem> = emptyMap()
     private var defaultStateId: String = ""
 
-    /** 当前高亮的事件规则；null 表示显示周期箭头。 */
     var highlightedEventRule: EventRule? = null
         private set
 
@@ -74,6 +58,25 @@ class StateGraphView(context: Context) : View(context) {
 
     // ==================== 手势 ====================
     private var onNodeDoubleTap: ((String) -> Unit)? = null
+
+    // ==================== 调色板（莫兰迪 12 色） ====================
+    // 低饱和（18%~30%）、中高明度（62%~73%）的多色。
+    // 状态数 ≤ 8 时用前 8 个（色相分散）；9~12 用后 4 个深色版本。
+    // 状态数 > 12 时不循环，走 generateMorandiColor 动态生成。
+    private val stateColorPalette = intArrayOf(
+        Color.parseColor("#A8B8C8"), // 0  灰蓝
+        Color.parseColor("#C8B8A8"), // 1  灰驼
+        Color.parseColor("#B8C8A8"), // 2  灰绿
+        Color.parseColor("#C8A8B8"), // 3  灰粉
+        Color.parseColor("#A8C8C8"), // 4  灰青
+        Color.parseColor("#C8C0A8"), // 5  灰卡其
+        Color.parseColor("#B0A8C8"), // 6  灰紫
+        Color.parseColor("#C8B0A0"), // 7  灰陶
+        Color.parseColor("#9EB0C0"), // 8  深灰蓝
+        Color.parseColor("#C0A090"), // 9  深灰驼
+        Color.parseColor("#90A898"), // 10 深灰绿
+        Color.parseColor("#B090A8")  // 11 深灰粉
+    )
 
     // ==================== 画笔 ====================
     private val nodeBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
@@ -107,13 +110,10 @@ class StateGraphView(context: Context) : View(context) {
         style = Paint.Style.FILL
         color = Color.parseColor("#FF6D00")
     }
+    // 概率标签文字画笔：无背景，颜色在绘制时按源色加深动态设置
     private val labelTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
-        color = Color.parseColor("#212121")
-    }
-    private val labelBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.FILL
-        color = Color.parseColor("#EEEEEE")
+        color = Color.parseColor("#333333")
     }
     private val hintPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
@@ -126,8 +126,6 @@ class StateGraphView(context: Context) : View(context) {
     private var arrowHeadLen = 16f
     private var arrowHeadWidth = 12f
     private var labelTextSize = 20f
-    private var labelPadH = 8f
-    private var labelPadV = 4f
     private var arrowDash = floatArrayOf(12f, 8f)
 
     // ==================== 手势识别 ====================
@@ -229,6 +227,8 @@ class StateGraphView(context: Context) : View(context) {
 
     // ==================== 布局 ====================
 
+    // 圆周布局，半径随状态数增长：R = max(240, 240 / sin(π/n))
+    // 相邻弦长恒为 480，n 从 2 到 15 之间都足够容纳箭头与标签。
     private fun layoutNodes() {
         nodePositions.clear()
         if (states.isEmpty()) return
@@ -237,8 +237,8 @@ class StateGraphView(context: Context) : View(context) {
             return
         }
         val n = states.size
-        val minR = nodeWidth * 1.3f / (2f * sin(PI / n).toFloat())
-        val radius = maxOf(minR, 300f)
+        val sinHalf = sin(PI / n).toFloat().coerceAtLeast(1e-3f)
+        val radius = maxOf(240f, 240f / sinHalf)
         for (i in 0 until n) {
             val angle = -PI / 2 + 2 * PI * i / n
             nodePositions[states[i].id] = PointF(
@@ -294,8 +294,6 @@ class StateGraphView(context: Context) : View(context) {
         arrowHeadLen = 16f * inv
         arrowHeadWidth = 12f * inv
         labelTextSize = 20f * inv
-        labelPadH = 8f * inv
-        labelPadV = 4f * inv
         arrowDash = floatArrayOf(12f * inv, 8f * inv)
 
         arrowLinePaint.strokeWidth = arrowStrokeW
@@ -346,13 +344,15 @@ class StateGraphView(context: Context) : View(context) {
 
     private fun drawTransitionArrows(canvas: Canvas) {
         arrowLinePaint.pathEffect = null
-        arrowFillPaint.color = Color.parseColor("#616161")
 
-        for (state in states) {
+        for ((stateIdx, state) in states.withIndex()) {
             val rules = state.rules
             if (rules.isEmpty()) continue
             val totalWeight = rules.sumOf { it.weight.coerceAtLeast(0) }
             if (totalWeight <= 0) continue
+
+            val sourceColor = colorForState(stateIdx)
+
             for (rule in rules) {
                 val toId = rule.targetStateId
                 val fromPos = nodePositions[state.id] ?: continue
@@ -364,7 +364,8 @@ class StateGraphView(context: Context) : View(context) {
                         weight = rule.weight,
                         totalWeight = totalWeight,
                         linePaint = arrowLinePaint,
-                        fillPaint = arrowFillPaint
+                        fillPaint = arrowFillPaint,
+                        sourceColor = sourceColor
                     )
                 } else {
                     val hasReverse = states.firstOrNull { it.id == toId }
@@ -374,7 +375,8 @@ class StateGraphView(context: Context) : View(context) {
                         probability = rule.weight.toFloat() / totalWeight,
                         hasReverse = hasReverse,
                         linePaint = arrowLinePaint,
-                        fillPaint = arrowFillPaint
+                        fillPaint = arrowFillPaint,
+                        sourceColor = sourceColor
                     )
                 }
             }
@@ -407,7 +409,8 @@ class StateGraphView(context: Context) : View(context) {
                 canvas, targetPos,
                 weight = 1, totalWeight = 1,
                 linePaint = eventLinePaint,
-                fillPaint = eventFillPaint
+                fillPaint = eventFillPaint,
+                sourceColor = Color.parseColor("#FF6D00")
             )
         }
     }
@@ -424,15 +427,9 @@ class StateGraphView(context: Context) : View(context) {
         drawArrowHead(canvas, (from.x + to.x) / 2, (from.y + to.y) / 2, ux, uy, eventFillPaint)
     }
 
-    // ==================== 直线箭头（带概率） ====================
+    // ==================== 直线箭头（带概率标签） ====================
 
-    /**
-     * 从 [from] 中心到 [to] 中心绘制箭头：
-     *  - 线段本身被节点覆盖两端，只中间部分可见。
-     *  - 箭头固定在**中点**，方向 = 起点→终点。
-     *  - 概率标签在中点垂直方向偏移，避免压住箭头。
-     *  - 双向边时偏移 12px，两条线分居两侧，标签同理。
-     */
+    // 箭头在中点；标签在箭头**尾巴**（沿线段方向往起点一侧偏移），无背景。
     private fun drawStraightArrow(
         canvas: Canvas,
         from: PointF,
@@ -440,7 +437,8 @@ class StateGraphView(context: Context) : View(context) {
         probability: Float,
         hasReverse: Boolean,
         linePaint: Paint,
-        fillPaint: Paint
+        fillPaint: Paint,
+        sourceColor: Int
     ) {
         val dx = to.x - from.x
         val dy = to.y - from.y
@@ -453,12 +451,16 @@ class StateGraphView(context: Context) : View(context) {
         val py = ux
 
         val lineOffset = if (hasReverse) 12f else 0f
-        val labelOffset = 32f
 
         val sx = from.x + px * lineOffset
         val sy = from.y + py * lineOffset
         val ex = to.x + px * lineOffset
         val ey = to.y + py * lineOffset
+
+        val oldLineColor = linePaint.color
+        val oldFillColor = fillPaint.color
+        linePaint.color = sourceColor
+        fillPaint.color = sourceColor
 
         canvas.drawLine(sx, sy, ex, ey, linePaint)
 
@@ -466,68 +468,58 @@ class StateGraphView(context: Context) : View(context) {
         val my = (sy + ey) / 2f
         drawArrowHead(canvas, mx, my, ux, uy, fillPaint)
 
-        val lx = mx + px * labelOffset
-        val ly = my + py * labelOffset
-        drawProbabilityLabel(canvas, formatProbability(probability), lx, ly)
+        // 标签放在箭头尾巴：从箭头中心沿反方向偏移 (箭头半长 + 余量)
+        val backOffset = arrowHeadLen / 2f + 14f
+        val lx = mx - ux * backOffset
+        val ly = my - uy * backOffset
+        drawProbabilityLabel(canvas, formatProbability(probability), lx, ly, sourceColor)
+
+        linePaint.color = oldLineColor
+        fillPaint.color = oldFillColor
     }
 
     // ==================== 自环 ====================
 
-    /**
-     * 自环。
-     *
-     * 【几何】
-     *  - 圆心固定在节点**左上角顶点** (pos.x - nodeWidth/2, pos.y - nodeHeight/2)。
-     *    完整圆绘制后，右下 1/4 被节点圆角矩形覆盖，自然形成圆弧。
-     *    放在角上便于计算，不随文字宽度变化。
-     *  - 半径 28f，比主线箭头小，视觉更轻。
-     *  - 颜色调浅：周期自环 #9E9E9E，事件自环 #FFB74D，弱化次要元素。
-     *  - 箭头位置：数学 135°（屏幕左上方）的圆上；
-     *    方向：数学 225°（屏幕左下方），即该点的切线方向，与半径垂直。
-     *  - 概率标签沿 135° 方向外移（r + 30），避免压住箭头。
-     *
-     * 【绘制顺序】自环在节点之前绘制，节点覆盖其右下部分。
-     */
     private fun drawSelfLoop(
         canvas: Canvas,
         nodePos: PointF,
         weight: Int,
         totalWeight: Int,
         linePaint: Paint,
-        fillPaint: Paint
+        fillPaint: Paint,
+        sourceColor: Int
     ) {
         val r = 28f
         val cx = nodePos.x - nodeWidth / 2f
         val cy = nodePos.y - nodeHeight / 2f
 
+        // 源色与白色 50% 混合，得到浅化色，视觉更轻
+        val rr = (sourceColor ushr 16) and 0xFF
+        val gg = (sourceColor ushr 8) and 0xFF
+        val bb = sourceColor and 0xFF
+        val lightColor = Color.rgb((rr + 255) / 2, (gg + 255) / 2, (bb + 255) / 2)
+
         val oldLineColor = linePaint.color
         val oldFillColor = fillPaint.color
-        val lightColor = if (linePaint === eventLinePaint) {
-            Color.parseColor("#FFB74D")
-        } else {
-            Color.parseColor("#9E9E9E")
-        }
         linePaint.color = lightColor
         fillPaint.color = lightColor
 
         canvas.drawCircle(cx, cy, r, linePaint)
 
-        // 箭头：数学 135° 位置（屏幕左上）
         val arrowAngle = Math.toRadians(135.0)
         val ax = cx + (r * cos(arrowAngle)).toFloat()
         val ay = cy - (r * sin(arrowAngle)).toFloat()
-        // 切向：数学 225°（屏幕左下）
         val tangentAngle = Math.toRadians(225.0)
         val ux = cos(tangentAngle).toFloat()
         val uy = -sin(tangentAngle).toFloat()
         drawArrowHead(canvas, ax, ay, ux, uy, fillPaint)
 
-        // 概率标签：沿 135° 外移，避免压住箭头
+        // 标签放在箭头尾巴：从箭头中心沿反方向偏移 (箭头半长 + 余量)
         val prob = weight.toFloat() / totalWeight.coerceAtLeast(1)
-        val labelOffset = r + 30f
-        val lx = cx + (labelOffset * cos(arrowAngle)).toFloat()
-        val ly = cy - (labelOffset * sin(arrowAngle)).toFloat()
-        drawProbabilityLabel(canvas, formatProbability(prob), lx, ly)
+        val backOffset = arrowHeadLen / 2f + 14f
+        val lx = ax - ux * backOffset
+        val ly = ay - uy * backOffset
+        drawProbabilityLabel(canvas, formatProbability(prob), lx, ly, sourceColor)
 
         linePaint.color = oldLineColor
         fillPaint.color = oldFillColor
@@ -535,7 +527,6 @@ class StateGraphView(context: Context) : View(context) {
 
     // ==================== 绘制辅助 ====================
 
-    /** 在 [cx,cy] 位置沿 [ux,uy] 方向绘制一个三角形箭头（中点为中心）。 */
     private fun drawArrowHead(
         canvas: Canvas,
         cx: Float, cy: Float,
@@ -559,28 +550,75 @@ class StateGraphView(context: Context) : View(context) {
         canvas.drawPath(path, fillPaint)
     }
 
-    private fun drawProbabilityLabel(canvas: Canvas, text: String, cx: Float, cy: Float) {
-        val w = labelTextPaint.measureText(text)
-        val h = labelTextSize
-        val rect = RectF(
-            cx - w / 2f - labelPadH,
-            cy - h / 2f - labelPadV,
-            cx + w / 2f + labelPadH,
-            cy + h / 2f + labelPadV
+    // 概率标签：无背景，直接画深色文字。
+    // 颜色 = 源色 × 0.55（加深），确保压在线段上仍可读。
+    private fun drawProbabilityLabel(
+        canvas: Canvas,
+        text: String,
+        cx: Float,
+        cy: Float,
+        sourceColor: Int
+    ) {
+        val r = (sourceColor ushr 16) and 0xFF
+        val g = (sourceColor ushr 8) and 0xFF
+        val b = sourceColor and 0xFF
+        val darkColor = Color.rgb(
+            (r * 0.55f).toInt().coerceIn(0, 255),
+            (g * 0.55f).toInt().coerceIn(0, 255),
+            (b * 0.55f).toInt().coerceIn(0, 255)
         )
-        canvas.drawRoundRect(rect, 6f, 6f, labelBgPaint)
+
+        val oldColor = labelTextPaint.color
+        labelTextPaint.color = darkColor
 
         val fm = labelTextPaint.fontMetrics
         val baselineY = cy - (fm.ascent + fm.descent) / 2f
         canvas.drawText(text, cx, baselineY, labelTextPaint)
+
+        labelTextPaint.color = oldColor
+    }
+
+    // ==================== 颜色生成 ====================
+
+    private fun colorForState(stateIndex: Int): Int =
+        if (stateIndex < stateColorPalette.size) {
+            stateColorPalette[stateIndex]
+        } else {
+            generateMorandiColor(stateIndex)
+        }
+
+    private fun generateMorandiColor(index: Int): Int {
+        val goldenAngle = 137.507764f
+        val hue = (index * goldenAngle) % 360f
+        val saturation = (18f + (index * 7) % 13) / 100f
+        val lightness = (62f + (index * 5) % 12) / 100f
+        return hslToColor(hue, saturation, lightness)
+    }
+
+    private fun hslToColor(h: Float, s: Float, l: Float): Int {
+        val c = (1f - abs(2f * l - 1f)) * s
+        val x = c * (1f - abs((h / 60f) % 2f - 1f))
+        val m = l - c / 2f
+        val r: Float
+        val g: Float
+        val b: Float
+        when {
+            h < 60f  -> { r = c; g = x; b = 0f }
+            h < 120f -> { r = x; g = c; b = 0f }
+            h < 180f -> { r = 0f; g = c; b = x }
+            h < 240f -> { r = 0f; g = x; b = c }
+            h < 300f -> { r = x; g = 0f; b = c }
+            else     -> { r = c; g = 0f; b = x }
+        }
+        return Color.rgb(
+            ((r + m) * 255f).toInt().coerceIn(0, 255),
+            ((g + m) * 255f).toInt().coerceIn(0, 255),
+            ((b + m) * 255f).toInt().coerceIn(0, 255)
+        )
     }
 
     // ==================== 概率格式化 ====================
 
-    /**
-     * 概率格式化：最多保留两位小数，去掉尾随 0，整数不带小数点。
-     * 0.1234 → "0.12"，0.5 → "0.5"，1.0 → "1"，0.1 → "0.1"。
-     */
     private fun formatProbability(p: Float): String {
         val s = String.format(Locale.US, "%.2f", p)
         if (!s.contains('.')) return s

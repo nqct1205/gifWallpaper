@@ -8,16 +8,10 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 
-/**
- * 资源列表页。
- *
- * 【职责】展示磁盘上所有 GIF 资源的元信息；提供导入与删除入口。
- * 删除时由 [MainActivity] 处理"提示引用方 + 删磁盘文件 + 同步清理"。
- *
- * 【元信息】尺寸 / 帧数 / 时长全部来自文件本身，用户不可改。
- */
+// 资源列表页。骨架由 ListPageScaffold 提供，本类只负责数据源与 item 渲染。
 class ResourceListPageBuilder(
     private val activity: Activity,
     private val config: ProjectConfig,
@@ -28,64 +22,43 @@ class ResourceListPageBuilder(
         fun onBack()
         fun onImportGif()
         fun onDeleteResource(resourceId: String)
+        fun onReorderResources(fromIndex: Int, toIndex: Int)
     }
 
-    fun build(): View {
-        val root = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(40, 40, 40, 40)
-            setBackgroundColor(Color.parseColor("#F5F5F5"))
-        }
-
-        // ---- 顶栏 ----
-        val topBar = LinearLayout(activity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        topBar.addView(Button(activity).apply {
-            text = "< 返回"
-            setOnClickListener { callbacks.onBack() }
-        })
-        topBar.addView(TextView(activity).apply {
-            text = "资源管理"
-            textSize = 20f
-            setTypeface(null, Typeface.BOLD)
-            setPadding(20, 0, 0, 0)
-        })
-        root.addView(topBar)
-
-        // ---- 导入按钮 ----
-        root.addView(Button(activity).apply {
-            text = "导入新 GIF"
-            setBackgroundColor(Color.parseColor("#4CAF50"))
-            setTextColor(Color.WHITE)
-            setOnClickListener { callbacks.onImportGif() }
-        }, matchWrap(top = 20, bottom = 20))
-
-        // ---- 列表 ----
-        if (config.resources.isEmpty()) {
-            root.addView(TextView(activity).apply {
-                text = "暂无资源，请先导入 GIF。"
-                textSize = 14f
-                setTextColor(Color.GRAY)
-                gravity = Gravity.CENTER
-                setPadding(0, 50, 0, 50)
-            })
-        } else {
-            // 用 toSortedMap 保证展示顺序稳定，与磁盘无关
-            for ((id, res) in config.resources.toSortedMap()) {
-                root.addView(buildResourceItem(id, res), matchWrap(bottom = 10))
+    fun build(scrollView: ScrollView): View {
+        return ListPageScaffold.build(
+            activity = activity,
+            scrollView = scrollView,
+            title = "资源管理",
+            actionText = "导入新 GIF",
+            actionColor = Color.parseColor("#4CAF50"),
+            emptyText = "暂无资源，请先导入 GIF。",
+            onBack = { callbacks.onBack() },
+            onAction = { callbacks.onImportGif() },
+            itemCount = config.resources.size,
+            bindItems = { column ->
+                val entries = config.resources.entries.toList()
+                column.setItems(
+                    items = entries,
+                    scrollView = scrollView,
+                    itemBuilder = { entry, _, handle ->
+                        buildResourceItem(entry.key, entry.value, handle)
+                    },
+                    onReorder = { from, to -> callbacks.onReorderResources(from, to) }
+                )
             }
-        }
-
-        return root
+        )
     }
 
-    private fun buildResourceItem(id: String, res: ResourceItem): View {
+    private fun buildResourceItem(id: String, res: ResourceItem, handle: View): View {
         val card = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(20, 20, 20, 20)
             setBackgroundColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 10 }
         }
 
         val headerRow = LinearLayout(activity).apply {
@@ -103,6 +76,7 @@ class ResourceListPageBuilder(
             setTextColor(Color.RED)
             setOnClickListener { callbacks.onDeleteResource(id) }
         })
+        headerRow.addView(handle)
         card.addView(headerRow)
 
         val info = res.info
@@ -118,9 +92,4 @@ class ResourceListPageBuilder(
         })
         return card
     }
-
-    private fun matchWrap(top: Int = 0, bottom: Int = 0) = LinearLayout.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT,
-        ViewGroup.LayoutParams.WRAP_CONTENT
-    ).apply { setMargins(0, top, 0, bottom) }
 }
