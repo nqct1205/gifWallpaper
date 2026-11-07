@@ -25,35 +25,35 @@ import android.view.MotionEvent
 import android.view.SurfaceHolder
 import java.io.File
 
-/**
- * GIF 状态机动态壁纸服务。
- *
- * 【分层】
- *  - [PlaybackController]：纯状态逻辑（周期、权重转移、事件切换）。
- *  - [GifEngine]：传感器接入、Drawable 生命周期、渲染、内存策略。
- *
- * 【多实例策略】同一动画内每个 [AnimationResourceRef] 拥有**独立的**
- * AnimatedImageDrawable 实例。原因：同一资源被同一动画引用多次时，若共享实例，
- * 播放进度会被强制同步，无法各自定位/缩放。代价是内存增加。
- * 后续可改为“共享解码数据 + 手动帧索引”（如 GifTexImage2D），当前先用多实例。
- *
- * 【多资源同步】同一动画内各资源假定长度一致（用户复用同一动画）。
- * 以第一个资源（主实例）的 onAnimationEnd 作为一圈结束信号；其他实例不注册回调。
- * 若长度不一致，按最短者计（主实例播完即视为一圈结束）。
- *
- * 【repeatCount】所有 drawable 设为 0（只播一遍）。理由：repeatCount 是“重复次数”，
- * 0 表示播 1 遍；外部 [PlaybackController] 按圈计数，两者 1:1 对应。
- *
- * 【背景色】每帧以当前状态所引用动画的 [AnimationItem.backgroundColor] 铺底；
- * 空串或解析失败回退黑色。见 [resolveCurrentBackgroundColor]。
- *
- * 【调试面板显示】状态与动画使用"名字 (id)"格式，见 [buildDebugState]。
- *
- * 【内存策略】
- *  - 不可见时若内存紧张（lowMemory 或 availMem < 150MB）：只保留当前动画，标记需重置。
- *  - 可见时 TRIM_MEMORY_MODERATE 及以上：释放非当前动画实例。
- *  - 恢复可见时若被释放过，从默认状态重播。
- */
+// GIF 状态机动态壁纸服务。
+//
+// 【核心设计（本轮重大变更）】
+// 状态切换由**定时器**驱动，不再依赖 AnimatedImageDrawable.onAnimationEnd。
+//
+// 原因：AnimatedImageDrawable 在 repeatCount = 0（播一遍）播完后，
+// start() 的重启行为在多实例场景下不可靠（实测播完后再 start() 不会重启，
+// 多次 enterState 反复 stop/start 后甚至永远停第一帧）。
+// onAnimationEnd 的回调也在这类状态下存在时序不可控问题。
+//
+// 新方案：
+//   - 动画一律 repeatCount = REPEAT_INFINITE，动画本身永远循环播放，视觉不卡。
+//   - 状态切换用 handler.postDelayed 定时器：时长 = GifInfo.totalDelayMs（一轮）。
+//   - 定时器每轮触发 playback.onCycleComplete()：未达目标圈数则原地继续
+//     （动画一直在播，不需要重启，仅重启定时器）；达到则切换状态。
+//   - onAnimationEnd 仅保留用于调试计数（onAnimationEndCount），不驱动任何逻辑。
+//
+// 【全局开关】来自 SharedPreferences "PetPrefs"：
+//   enableOrientation / enableShake / enableClick：是否启用对应主事件
+//   shakeSensitivity：摇一摇阈值（g）
+//   showDebug / limitDraw / limitMem：调试
+//
+// 【传感器注册策略】
+//   GRAVITY: enableOrientation || enableShake || userShowDebug
+//   ACCEL:   enableShake || userShowDebug
+//   开关只拦截触发行为，不影响注册（条件判定可能仍需要方向）。
+//   不可见时统一注销。
+//
+// 【多实例】同一动画内每个资源引用一个独立 AnimatedImageDrawable。
 class GifWallpaperService : WallpaperService() {
 
     @Volatile private var currentEngine: GifEngine? = null
@@ -65,11 +65,6 @@ class GifWallpaperService : WallpaperService() {
         currentEngine?.handleTrimMemory(level)
     }
 
-    /**
-     * 渲染实例：每个资源引用对应一个独立的 AnimatedImageDrawable。
-     *
-     * 放在 [GifEngine] 外部，因为 Kotlin 的 inner class 内部不允许声明嵌套类/数据类。
-     */
     private data class RenderInstance(
         val ref: AnimationResourceRef,
         val drawable: AnimatedImageDrawable,
@@ -79,13 +74,13 @@ class GifWallpaperService : WallpaperService() {
     inner class GifEngine : Engine(), SharedPreferences.OnSharedPreferenceChangeListener,
         SensorEventListener {
 
-        // ======================== 线程与生命周期 ========================
+        // ==================== 线程与生命周期 ====================
         private val handler = Handler(Looper.getMainLooper())
         @Volatile private var visible = false
         @Volatile private var destroyed = false
         @Volatile private var ready = false
 
-        // ======================== 数据 ========================
+        // ==================== 数据 ====================
         private var config: ProjectConfig = ProjectConfig()
         private val playback = PlaybackController { config }
 
@@ -96,7 +91,15 @@ class GifWallpaperService : WallpaperService() {
         private var loaderThread: Thread? = null
         private var prefs: SharedPreferences? = null
 
-        // ======================== 传感器 ========================
+        // ==================== 周期定时器（核心） ====================
+        private var cycleTimerRunnable: Runnable? = null
+
+        // ==================== 全局开关 ====================
+        private var enableOrientation = true
+        private var enableShake = true
+        private var enableClick = true
+
+        // ==================== 传感器 ====================
         private val sensorManager by lazy {
             getSystemService(Context.SENSOR_SERVICE) as SensorManager
         }
@@ -105,11 +108,12 @@ class GifWallpaperService : WallpaperService() {
         private var gravitySensor: Sensor? = null
         private var accelSensor: Sensor? = null
         private var sensorsRegistered = false
-        private var lastOrientationParam: String? = null
+        private var gravityRegistered = false
+        private var accelRegistered = false
         private var lastHandledShakeElapsed = 0L
         private var lastHandledClickText = ""
 
-        // ======================== 调试 ========================
+        // ==================== 调试 ====================
         private var userShowDebug = false
         private var limitDrawTime = 20
         private var limitMemory = 150
@@ -123,25 +127,23 @@ class GifWallpaperService : WallpaperService() {
         private var currentMemMb = 0
         private var loadErrorMsg = ""
 
+        // 调试计数器：用于诊断
+        @Volatile private var onAnimationEndCount = 0
+        @Volatile private var enterStateCount = 0
+        @Volatile private var cycleTimerCount = 0
+
         private val debugRenderer = DebugOverlayRenderer()
         private val memInfo = Debug.MemoryInfo()
 
-        // ======================== 并发 & 内存策略 ========================
+        // ==================== 并发 & 内存策略 ====================
         @Volatile private var loadGeneration = 0
         private var needsResetOnVisible = false
         private val LOW_MEM_AVAIL_MB = 150L
 
-        // ======================== 回调 ========================
-
+        // ==================== 动画回调（仅调试计数，不驱动逻辑） ====================
         private val animCallback = object : Animatable2.AnimationCallback() {
             override fun onAnimationEnd(drawable: Drawable?) {
-                if (destroyed || !visible) return
-                val nextId = playback.onCycleComplete()
-                if (nextId != currentRenderStateId) {
-                    enterState(nextId)
-                } else {
-                    restartCurrentAnimation()
-                }
+                onAnimationEndCount++
             }
         }
 
@@ -154,31 +156,79 @@ class GifWallpaperService : WallpaperService() {
             }
         }
 
-        // ======================== 生命周期 ========================
+        // ==================== 生命周期 ====================
 
         override fun onCreate(surfaceHolder: SurfaceHolder) {
             super.onCreate(surfaceHolder)
             setTouchEventsEnabled(true)
             prefs = getSharedPreferences("PetPrefs", Context.MODE_PRIVATE)
             prefs?.registerOnSharedPreferenceChangeListener(this)
+            readGlobalPrefs()
+
             gravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)
             accelSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+
+            motionTracker.onOrientationChanged = { newOrientation ->
+                handler.post { handleOrientationChanged(newOrientation) }
+            }
         }
 
         override fun onDestroy() {
             super.onDestroy()
             prefs?.unregisterOnSharedPreferenceChangeListener(this)
             unregisterSensors()
+            cancelCycleTimer()
             cleanupAnimCallbacks()
         }
 
+        private fun readGlobalPrefs() {
+            val p = prefs ?: return
+            userShowDebug = p.getBoolean("showDebug", false)
+            limitDrawTime = p.getInt("limitDraw", 20)
+            limitMemory = p.getInt("limitMem", 150)
+            enableOrientation = p.getBoolean("enableOrientation", true)
+            enableShake = p.getBoolean("enableShake", true)
+            enableClick = p.getBoolean("enableClick", true)
+            val sensitivity = p.getFloat("shakeSensitivity", 2.4f)
+            motionTracker.setShakeThreshold(sensitivity)
+        }
+
         override fun onSharedPreferenceChanged(sharedPreferences: SharedPreferences?, key: String?) {
-            if (key == "showDebug" || key == "limitDraw" || key == "limitMem") {
-                handler.post {
-                    userShowDebug = sharedPreferences?.getBoolean("showDebug", false) ?: false
-                    limitDrawTime = sharedPreferences?.getInt("limitDraw", 20) ?: 20
-                    limitMemory = sharedPreferences?.getInt("limitMem", 150) ?: 150
-                    forceShowDebug = false
+            if (sharedPreferences == null) return
+            when (key) {
+                "showDebug", "limitDraw", "limitMem" -> {
+                    handler.post {
+                        userShowDebug = sharedPreferences.getBoolean("showDebug", false)
+                        limitDrawTime = sharedPreferences.getInt("limitDraw", 20)
+                        limitMemory = sharedPreferences.getInt("limitMem", 150)
+                        forceShowDebug = false
+                        if (userShowDebug && !sensorsRegistered && visible) {
+                            registerSensorsIfNeeded()
+                        }
+                    }
+                }
+                "enableOrientation" -> {
+                    handler.post {
+                        enableOrientation = sharedPreferences.getBoolean("enableOrientation", true)
+                        if (!sensorsRegistered && visible) registerSensorsIfNeeded()
+                    }
+                }
+                "enableShake" -> {
+                    handler.post {
+                        enableShake = sharedPreferences.getBoolean("enableShake", true)
+                        if (!sensorsRegistered && visible) registerSensorsIfNeeded()
+                    }
+                }
+                "enableClick" -> {
+                    handler.post {
+                        enableClick = sharedPreferences.getBoolean("enableClick", true)
+                    }
+                }
+                "shakeSensitivity" -> {
+                    handler.post {
+                        val v = sharedPreferences.getFloat("shakeSensitivity", 2.4f)
+                        motionTracker.setShakeThreshold(v)
+                    }
                 }
             }
         }
@@ -191,16 +241,6 @@ class GifWallpaperService : WallpaperService() {
             loadInBackground()
         }
 
-        /**
-         * 可见时系统内存告急。
-         *
-         * 关于 [ComponentCallbacks2.TRIM_MEMORY_MODERATE] 的 deprecated 警告：
-         * API 34 起该常量被标记为 deprecated。系统仍会回调此级别，
-         * WallpaperService 场景下没有更精确的替代信号，故继续使用。
-         *
-         * 【刻意保留此警告】有意为之：留着编译器提示，作为未来复查的锚点。
-         * 若某天升级 compileSdk 或调整内存策略，这行警告会主动提醒回来看此处。
-         */
         fun handleTrimMemory(level: Int) {
             if (destroyed) return
             if (level >= ComponentCallbacks2.TRIM_MEMORY_MODERATE) {
@@ -208,17 +248,13 @@ class GifWallpaperService : WallpaperService() {
             }
         }
 
-        // ======================== 后台加载 ========================
+        // ==================== 后台加载 ====================
 
         private fun loadInBackground() {
             val gen = ++loadGeneration
             loaderThread?.interrupt()
             loaderThread = Thread {
                 try {
-                    val uShowDebug = prefs?.getBoolean("showDebug", false) ?: false
-                    val lDraw = prefs?.getInt("limitDraw", 20) ?: 20
-                    val lMem = prefs?.getInt("limitMem", 150) ?: 150
-
                     var cfg = ProjectConfig()
                     var cfgMsg: String? = null
                     when (val r = ProjectConfigStore.load(this@GifWallpaperService)) {
@@ -244,7 +280,8 @@ class GifWallpaperService : WallpaperService() {
                             val drawable = decodeAnimatedDrawable(file) ?: run {
                                 sb.append("解码失败: ${resource.id}\n"); null
                             } ?: continue
-                            drawable.repeatCount = 0
+                            // 无限循环：动画永久播，不依赖 repeatCount=0 的重启
+                            drawable.repeatCount = AnimatedImageDrawable.REPEAT_INFINITE
                             instances.add(RenderInstance(ref, drawable, resource.info))
                         }
                         if (instances.isNotEmpty()) newCache[animId] = instances
@@ -257,18 +294,19 @@ class GifWallpaperService : WallpaperService() {
                         cleanupAnimCallbacks()
                         animRuntimeCache.clear()
 
+                        // 仅主实例注册回调（用于调试计数）
                         for ((_, instances) in newCache) {
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                                instances.firstOrNull()?.drawable?.registerAnimationCallback(animCallback)
+                                try {
+                                    instances.firstOrNull()?.drawable?.registerAnimationCallback(animCallback)
+                                } catch (_: Exception) {}
                             }
                         }
 
                         config = cfg
                         animRuntimeCache.putAll(newCache)
                         loadErrorMsg = sb.toString()
-                        userShowDebug = uShowDebug
-                        limitDrawTime = lDraw
-                        limitMemory = lMem
+                        readGlobalPrefs()
                         forceShowDebug = false
                         engineStartTime = SystemClock.elapsedRealtime()
 
@@ -309,7 +347,7 @@ class GifWallpaperService : WallpaperService() {
             }
         }
 
-        // ======================== 解码 ========================
+        // ==================== 解码 ====================
 
         private fun decodeAnimatedDrawable(file: File): AnimatedImageDrawable? {
             if (!file.exists() || Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
@@ -339,9 +377,11 @@ class GifWallpaperService : WallpaperService() {
             }
         }
 
-        // ======================== 状态切换 ========================
+        // ==================== 状态切换（核心） ====================
 
         private fun enterState(stateId: String) {
+            enterStateCount++
+            cancelCycleTimer()
             currentRenderStateId = stateId
             val state = config.states[stateId]
             val animId = state?.animationId ?: ""
@@ -350,28 +390,51 @@ class GifWallpaperService : WallpaperService() {
                 "无可用动画实例: state=$stateId"
             } else ""
 
+            // stop + setVisible 让 drawable 从第一帧开始（即使之前播过）
             for (inst in currentRuntime) {
                 try { inst.drawable.stop() } catch (_: Exception) {}
-                inst.drawable.setVisible(true, true)
+                try { inst.drawable.setVisible(true, true) } catch (_: Exception) {}
             }
             if (visible) {
                 for (inst in currentRuntime) {
                     try { inst.drawable.start() } catch (_: Exception) {}
                 }
             }
+
+            scheduleNextCycle()
         }
 
-        private fun restartCurrentAnimation() {
-            for (inst in currentRuntime) {
-                try { inst.drawable.stop() } catch (_: Exception) {}
-                inst.drawable.setVisible(true, true)
-                if (visible) {
-                    try { inst.drawable.start() } catch (_: Exception) {}
+        // 计划下一轮定时器。时长 = GifInfo.totalDelayMs（一轮）。
+        // 到时时调用 onCycleComplete：
+        //   - 未达目标圈数：只重启定时器（动画一直在播，不用重启）
+        //   - 达到目标：切换状态（enterState 会取消旧定时器并启动新的）
+        private fun scheduleNextCycle() {
+            cancelCycleTimer()
+            if (!visible || destroyed) return
+            val totalDelay = currentRuntime.firstOrNull()?.info?.totalDelayMs ?: 0
+            if (totalDelay <= 0) return
+
+            val runnable = Runnable {
+                cycleTimerCount++
+                if (destroyed || !visible) return@Runnable
+                val nextId = playback.onCycleComplete()
+                if (nextId != currentRenderStateId) {
+                    enterState(nextId)
+                } else {
+                    // 原地重播：动画没变，只重启定时器
+                    scheduleNextCycle()
                 }
             }
+            cycleTimerRunnable = runnable
+            handler.postDelayed(runnable, totalDelay.toLong())
         }
 
-        // ======================== 释放 ========================
+        private fun cancelCycleTimer() {
+            cycleTimerRunnable?.let { handler.removeCallbacks(it) }
+            cycleTimerRunnable = null
+        }
+
+        // ==================== 释放 ====================
 
         private fun isMemoryCramped(): Boolean {
             return try {
@@ -412,27 +475,37 @@ class GifWallpaperService : WallpaperService() {
             }
         }
 
-        // ======================== 传感器 ========================
+        // ==================== 传感器注册 ====================
 
         private fun registerSensorsIfNeeded() {
             if (sensorsRegistered || destroyed) return
-            val hasOrientationRule = config.eventRules.any { it.type == EventType.ORIENTATION }
-            val hasShakeRule = config.eventRules.any { it.type == EventType.SHAKE }
-            if (!hasOrientationRule && !hasShakeRule) return
 
-            if (hasOrientationRule && gravitySensor != null) {
-                sensorManager.registerListener(this, gravitySensor, SensorManager.SENSOR_DELAY_NORMAL)
+            val needGravity = enableOrientation || enableShake || userShowDebug
+            val needAccel = enableShake || userShowDebug
+
+            if (!needGravity && !needAccel) return
+
+            if (needGravity && gravitySensor != null) {
+                sensorManager.registerListener(
+                    this, gravitySensor, SensorManager.SENSOR_DELAY_NORMAL
+                )
+                gravityRegistered = true
             }
-            if (hasShakeRule && accelSensor != null) {
-                sensorManager.registerListener(this, accelSensor, SensorManager.SENSOR_DELAY_UI)
+            if (needAccel && accelSensor != null) {
+                sensorManager.registerListener(
+                    this, accelSensor, SensorManager.SENSOR_DELAY_UI
+                )
+                accelRegistered = true
             }
-            sensorsRegistered = true
+            sensorsRegistered = gravityRegistered || accelRegistered
         }
 
         private fun unregisterSensors() {
             if (sensorsRegistered) {
                 sensorManager.unregisterListener(this)
                 sensorsRegistered = false
+                gravityRegistered = false
+                accelRegistered = false
             }
         }
 
@@ -440,26 +513,14 @@ class GifWallpaperService : WallpaperService() {
             motionTracker.onSensorChanged(event)
             if (!visible || destroyed) return
 
-            if (event.sensor.type == Sensor.TYPE_GRAVITY) {
-                val s = motionTracker.state
-                val param = when {
-                    s.gz > 0.7f -> EventRule.ORIENTATION_FORWARD
-                    s.gz < -0.7f -> EventRule.ORIENTATION_REVERSE
-                    else -> null
-                }
-                if (param != null && param != lastOrientationParam) {
-                    lastOrientationParam = param
-                    if (playback.handleEvent(EventType.ORIENTATION, param)) {
-                        enterState(playback.currentStateId())
-                    }
-                }
-            }
-
             if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
                 val s = motionTracker.state
                 if (s.lastShakeElapsedMs > lastHandledShakeElapsed) {
                     lastHandledShakeElapsed = s.lastShakeElapsedMs
-                    if (playback.handleEvent(EventType.SHAKE, "")) {
+                    if (!enableShake) return
+                    val hasShakeRule = config.eventRules.any { it.type == EventType.SHAKE }
+                    if (!hasShakeRule) return
+                    if (playback.handleEvent(EventType.SHAKE, "", s.orientation)) {
                         enterState(playback.currentStateId())
                     }
                 }
@@ -468,7 +529,18 @@ class GifWallpaperService : WallpaperService() {
 
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 
-        // ======================== 触摸 ========================
+        private fun handleOrientationChanged(newOrientation: DeviceOrientation) {
+            if (destroyed || !visible) return
+            if (newOrientation == DeviceOrientation.UNKNOWN) return
+            if (!enableOrientation) return
+            val hasOrientationRule = config.eventRules.any { it.type == EventType.ORIENTATION }
+            if (!hasOrientationRule) return
+            if (playback.handleEvent(EventType.ORIENTATION, newOrientation.name, newOrientation)) {
+                enterState(playback.currentStateId())
+            }
+        }
+
+        // ==================== 触摸 ====================
 
         override fun onTouchEvent(event: MotionEvent) {
             touchTracker.onTouchEvent(event)
@@ -476,14 +548,17 @@ class GifWallpaperService : WallpaperService() {
                 val s = touchTracker.state
                 if (s.lastClickText != lastHandledClickText && s.lastClickText != "无") {
                     lastHandledClickText = s.lastClickText
-                    if (playback.handleEvent(EventType.CLICK, "")) {
+                    if (!enableClick) return
+                    val hasClickRule = config.eventRules.any { it.type == EventType.CLICK }
+                    if (!hasClickRule) return
+                    if (playback.handleEvent(EventType.CLICK, "", motionTracker.state.orientation)) {
                         enterState(playback.currentStateId())
                     }
                 }
             }
         }
 
-        // ======================== 可见性 ========================
+        // ==================== 可见性 ====================
 
         override fun onVisibilityChanged(visible: Boolean) {
             this.visible = visible
@@ -497,6 +572,8 @@ class GifWallpaperService : WallpaperService() {
                     for (inst in currentRuntime) {
                         try { inst.drawable.start() } catch (_: Exception) {}
                     }
+                    // 恢复定时器（进入不可见时被取消）
+                    scheduleNextCycle()
                 }
                 if (ready) {
                     handler.removeCallbacks(drawRunnable)
@@ -507,6 +584,7 @@ class GifWallpaperService : WallpaperService() {
                     try { inst.drawable.stop() } catch (_: Exception) {}
                 }
                 handler.removeCallbacks(drawRunnable)
+                cancelCycleTimer()
                 unregisterSensors()
                 maybeReleaseOnInvisible()
             }
@@ -523,6 +601,7 @@ class GifWallpaperService : WallpaperService() {
             visible = false
             ready = false
             handler.removeCallbacks(drawRunnable)
+            cancelCycleTimer()
             loaderThread?.interrupt()
             loaderThread = null
             unregisterSensors()
@@ -531,7 +610,7 @@ class GifWallpaperService : WallpaperService() {
             currentRuntime = emptyList()
         }
 
-        // ======================== 渲染 ========================
+        // ==================== 渲染 ====================
 
         private fun drawFrame(): Long {
             val holder = surfaceHolder
@@ -607,20 +686,12 @@ class GifWallpaperService : WallpaperService() {
             }
         }
 
-        /**
-         * 解析当前状态所引用动画的背景填充色。
-         * 无背景色 / 解析失败时回退为黑色。
-         */
         private fun resolveCurrentBackgroundColor(): Int {
             val animId = config.states[currentRenderStateId]?.animationId ?: return Color.BLACK
             val anim = config.animations[animId] ?: return Color.BLACK
             return parseColorSafe(anim.backgroundColor) ?: Color.BLACK
         }
 
-        /**
-         * 计算单个资源的绘制矩形。
-         * anchor：GIF 上的点；targetAnchor：屏幕上的点；offset：微调。
-         */
         private fun computeBounds(
             ref: AnimationResourceRef, info: GifInfo, screenW: Int, screenH: Int
         ): RectF {
@@ -649,12 +720,6 @@ class GifWallpaperService : WallpaperService() {
             return RectF(left, top, left + scaledW, top + scaledH)
         }
 
-        /**
-         * 构造调试面板数据。
-         *
-         * 【显示格式】状态与动画均使用"名字 (id)"格式，由 [formatStateDisplay] /
-         * [formatAnimDisplay] 生成；无状态/无动画时给出明确文本。
-         */
         private fun buildDebugState(now: Long, isAlarm: Boolean): DebugOverlayRenderer.DebugState {
             val primaryInfo = currentRuntime.firstOrNull()?.info
             val frameIdx: Int = if (primaryInfo != null && primaryInfo.frameCount > 0 && primaryInfo.totalDelayMs > 0) {
@@ -667,9 +732,15 @@ class GifWallpaperService : WallpaperService() {
             val motion = motionTracker.state
             val touch = touchTracker.state
 
-            // 当前状态对象与它引用的动画对象
             val state = config.states[playback.currentStateId()]
             val anim = state?.let { config.animations[it.animationId] }
+
+            val sensorStatus = when {
+                gravityRegistered && accelRegistered -> "GRAVITY+ACCEL"
+                gravityRegistered -> "仅GRAVITY"
+                accelRegistered -> "仅ACCEL"
+                else -> "未注册"
+            }
 
             return DebugOverlayRenderer.DebugState(
                 stateName = if (state != null) {
@@ -691,8 +762,15 @@ class GifWallpaperService : WallpaperService() {
                 frameIndexIsEstimate = true,
                 animationDisplay = if (anim != null) formatAnimDisplay(anim) else "无",
                 postureText = motion.postureText,
+                lastShakeText = motion.lastShakeText,
+                gForce = motion.gForce,
+                shakeThresholdG = motionTracker.shakeThresholdG,
+                sensorStatus = sensorStatus,
                 isShaking = motionTracker.isShaking(),
-                isTouching = touch.isTouching
+                isTouching = touch.isTouching,
+                onAnimationEndCount = onAnimationEndCount,
+                enterStateCount = enterStateCount,
+                cycleTimerCount = cycleTimerCount
             )
         }
     }

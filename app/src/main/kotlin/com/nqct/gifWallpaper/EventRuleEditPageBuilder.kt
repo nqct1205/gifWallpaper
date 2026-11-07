@@ -16,32 +16,20 @@ import android.widget.RadioGroup
 import android.widget.Spinner
 import android.widget.TextView
 
-/**
- * 事件规则编辑页。
- *
- * 【编辑内容】
- *  - 事件类型：方向改变 / 摇一摇 / 点击。
- *  - 触发参数：仅方向事件需要（正向 / 反向）。
- *  - 触发状态集：多选；**不勾选任何状态 = 任意状态**。显示“状态名 (id)”。
- *  - 目标状态：单选。显示“状态名 (id)”。
- *
- * 【新建模式】ruleId 为 null 时立即生成新规则并加入 config，
- * 用户点“删除”即移除（等价取消）。
- *
- * 【空规则的处理路径】说明本页不主动清理空规则的边界：
- *  1. 新建模式下用户点系统返回键（非“删除规则”按钮）时，
- *     规则已加入 config.eventRules，但 [targetStateId] 可能仍为空字符串。
- *     本页**不做清理**，原因：
- *       - [PlaybackController.handleEvent] 遇到 targetStateId 为空时会直接忽略，无害；
- *       - 若用户在编辑期间临时切到其他状态页添加状态再返回，规则内容仍保留，
- *         强行清理会丢掉用户已填的触发状态集 / 类型选择。
- *  2. 用户下次进入列表页会看到这条“目标状态: 未设置”的规则，可手动删除或补完。
- *  3. 若未来需要自动清理，可在 [MainActivity] 的配置保存前做一次全局校验，
- *     把 targetStateId 为空且 sourceStateIds 也为空的“双重空”规则剔除；
- *     当前不实现，避免复杂化。
- *
- * 【当前策略】规则是确定性的：匹配即跳转。后续可扩展概率，见 [EventRule] 注释。
- */
+// 事件规则编辑页。
+//
+// 编辑内容：
+//   - 主事件类型：方向改变 / 摇一摇 / 点击。
+//   - 主事件参数：仅方向事件需要（6 方向单选）；语义为"手机变为该方向"。
+//   - 附加条件：事件触发瞬间需满足的快照条件。当前仅支持"当前方向 = X"，
+//     留空表示无条件。结构上预留扩展（EventCondition 列表）。
+//   - 触发状态集：多选；不勾选任何状态 = 任意状态。
+//   - 目标状态：单选。
+//
+// 新建模式：ruleId 为 null 时立即生成新规则加入 config，用户点"删除"即移除。
+// 空规则不主动清理：targetStateId 为空时 PlaybackController.handleEvent 会忽略。
+//
+// 当前策略：主事件确定性触发（匹配即跳转）。后续可扩展概率 / 多目标。
 class EventRuleEditPageBuilder(
     private val activity: Activity,
     private val config: ProjectConfig,
@@ -55,8 +43,17 @@ class EventRuleEditPageBuilder(
         fun onDelete()
     }
 
+    // 6 方向列表（不含 UNKNOWN）
+    private val allOrientations = listOf(
+        DeviceOrientation.SCREEN_UP,
+        DeviceOrientation.SCREEN_DOWN,
+        DeviceOrientation.PORTRAIT,
+        DeviceOrientation.PORTRAIT_REVERSED,
+        DeviceOrientation.LANDSCAPE_LEFT,
+        DeviceOrientation.LANDSCAPE_RIGHT
+    )
+
     fun build(): View {
-        // 新建模式：立即创建并加入 config
         val rule: EventRule = if (ruleId != null) {
             config.eventRules.firstOrNull { it.id == ruleId } ?: return View(activity)
         } else {
@@ -71,7 +68,7 @@ class EventRuleEditPageBuilder(
             setBackgroundColor(Color.parseColor("#F5F5F5"))
         }
 
-        // ---- 顶栏 ----
+        // 顶栏
         val topBar = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -88,68 +85,18 @@ class EventRuleEditPageBuilder(
         })
         root.addView(topBar)
 
-        // ---- 事件类型 ----
+        // 主事件类型
         root.addView(TextView(activity).apply {
             text = "事件类型"
             textSize = 14f
             setPadding(0, 20, 0, 5)
         })
 
-        val paramContainer = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
-        root.addView(paramContainer)
+        val primaryParamContainer = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(primaryParamContainer)
 
-        fun rebuildParamUi() {
-            paramContainer.removeAllViews()
-            when (rule.type) {
-                EventType.ORIENTATION -> {
-                    paramContainer.addView(TextView(activity).apply {
-                        text = "触发方向"
-                        textSize = 14f
-                        setPadding(0, 15, 0, 5)
-                    })
-                    val rg = RadioGroup(activity).apply { orientation = RadioGroup.HORIZONTAL }
-                    val rbForward = RadioButton(activity).apply {
-                        id = View.generateViewId()
-                        text = "正向放置（屏幕朝上）"
-                        textSize = 13f
-                        isChecked = rule.triggerParam == EventRule.ORIENTATION_FORWARD ||
-                            rule.triggerParam.isEmpty()
-                    }
-                    val rbReverse = RadioButton(activity).apply {
-                        id = View.generateViewId()
-                        text = "反向放置（屏幕朝下）"
-                        textSize = 13f
-                        isChecked = rule.triggerParam == EventRule.ORIENTATION_REVERSE
-                    }
-                    rg.addView(rbForward)
-                    rg.addView(rbReverse)
-                    rg.setOnCheckedChangeListener { _, checkedId ->
-                        rule.triggerParam = if (checkedId == rbReverse.id) {
-                            EventRule.ORIENTATION_REVERSE
-                        } else {
-                            EventRule.ORIENTATION_FORWARD
-                        }
-                    }
-                    // 初始修正空值
-                    if (rule.triggerParam.isEmpty()) {
-                        rule.triggerParam = EventRule.ORIENTATION_FORWARD
-                    }
-                    paramContainer.addView(rg)
-                }
-                EventType.SHAKE, EventType.CLICK -> {
-                    // 无额外参数；清空 triggerParam 避免脏数据
-                    rule.triggerParam = ""
-                    paramContainer.addView(TextView(activity).apply {
-                        text = when (rule.type) {
-                            EventType.SHAKE -> "摇一摇：检测到摇动时触发"
-                            else -> "点击：在壁纸上点击时触发"
-                        }
-                        textSize = 13f
-                        setTextColor(Color.GRAY)
-                        setPadding(0, 10, 0, 5)
-                    })
-                }
-            }
+        fun rebuildPrimaryParamUi() {
+            buildPrimaryParamUi(rule, primaryParamContainer)
         }
 
         val rgType = RadioGroup(activity).apply { orientation = RadioGroup.VERTICAL }
@@ -177,12 +124,17 @@ class EventRuleEditPageBuilder(
                 rbClick.id -> EventType.CLICK
                 else -> EventType.ORIENTATION
             }
-            rebuildParamUi()
+            rebuildPrimaryParamUi()
         }
         root.addView(rgType)
-        rebuildParamUi()
+        rebuildPrimaryParamUi()
 
-        // ---- 触发状态集 ----
+        // 附加条件
+        val conditionContainer = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(conditionContainer)
+        buildConditionUi(rule, conditionContainer)
+
+        // 触发状态集
         root.addView(TextView(activity).apply {
             text = "触发状态集（不勾选任何状态 = 任意状态）"
             textSize = 14f
@@ -213,7 +165,7 @@ class EventRuleEditPageBuilder(
             }
         }
 
-        // ---- 目标状态 ----
+        // 目标状态
         root.addView(TextView(activity).apply {
             text = "目标状态"
             textSize = 14f
@@ -246,18 +198,151 @@ class EventRuleEditPageBuilder(
                     override fun onNothingSelected(parent: AdapterView<*>?) {}
                 }
             }
-            // 防御性：目标为空或失效时纠正
+            // 目标为空或失效时纠正
             if (config.states[rule.targetStateId] == null) {
                 rule.targetStateId = targetIds.first()
             }
             root.addView(spinner)
         }
 
-        // ---- 底部操作 ----
+        // 底部操作
         root.addView(buildBottomBar(), matchWrap(top = 30))
 
         return root
     }
+
+    // ==================== 主事件参数区 ====================
+
+    private fun buildPrimaryParamUi(rule: EventRule, container: LinearLayout) {
+        container.removeAllViews()
+        when (rule.type) {
+            EventType.ORIENTATION -> {
+                container.addView(TextView(activity).apply {
+                    text = "触发方向（手机变为该方向时触发）"
+                    textSize = 14f
+                    setPadding(0, 15, 0, 5)
+                })
+
+                // 6 方向 3 行 2 列。不用 RadioGroup，手动互斥管理。
+                val radios = mutableListOf<RadioButton>()
+                fun refreshChecks() {
+                    for (rb in radios) {
+                        rb.isChecked = (rb.tag as String) == rule.triggerParam
+                    }
+                }
+                for (pair in listOf(
+                    listOf(DeviceOrientation.SCREEN_UP, DeviceOrientation.SCREEN_DOWN),
+                    listOf(DeviceOrientation.PORTRAIT, DeviceOrientation.PORTRAIT_REVERSED),
+                    listOf(DeviceOrientation.LANDSCAPE_LEFT, DeviceOrientation.LANDSCAPE_RIGHT)
+                )) {
+                    val row = LinearLayout(activity).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                    }
+                    for (ori in pair) {
+                        val rb = RadioButton(activity).apply {
+                            text = ori.label
+                            textSize = 13f
+                            tag = ori.name
+                            isChecked = rule.triggerParam == ori.name
+                            layoutParams = LinearLayout.LayoutParams(
+                                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+                            )
+                            setOnClickListener {
+                                rule.triggerParam = ori.name
+                                refreshChecks()
+                            }
+                        }
+                        radios.add(rb)
+                        row.addView(rb)
+                    }
+                    container.addView(row)
+                }
+
+                // 确保 triggerParam 是合法方向（默认 SCREEN_UP）
+                if (allOrientations.none { it.name == rule.triggerParam }) {
+                    rule.triggerParam = DeviceOrientation.SCREEN_UP.name
+                    refreshChecks()
+                }
+            }
+            EventType.SHAKE, EventType.CLICK -> {
+                rule.triggerParam = ""
+                container.addView(TextView(activity).apply {
+                    text = when (rule.type) {
+                        EventType.SHAKE -> "摇一摇：检测到摇动时触发"
+                        else -> "点击：在壁纸上点击时触发"
+                    }
+                    textSize = 13f
+                    setTextColor(Color.GRAY)
+                    setPadding(0, 10, 0, 5)
+                })
+            }
+        }
+    }
+
+    // ==================== 附加条件区 ====================
+
+    private fun buildConditionUi(rule: EventRule, container: LinearLayout) {
+        container.removeAllViews()
+        container.addView(TextView(activity).apply {
+            text = "附加条件（事件触发瞬间需满足；选\"任意\"表示无条件）"
+            textSize = 14f
+            setPadding(0, 20, 0, 5)
+        })
+
+        // 当前只有"当前方向"一种条件。取第一条 ORIENTATION 条件。
+        val existing = rule.conditions.firstOrNull { it.type == EventType.ORIENTATION }
+
+        val row = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        row.addView(TextView(activity).apply {
+            text = "当前方向: "
+            textSize = 13f
+        })
+
+        val options = mutableListOf<String>()
+        options.add("任意")
+        for (ori in allOrientations) options.add(ori.label)
+
+        val currentIdx = if (existing != null) {
+            val idx = allOrientations.indexOfFirst { it.name == existing.param }
+            if (idx >= 0) idx + 1 else 0
+        } else 0
+
+        val spinner = Spinner(activity).apply {
+            adapter = ArrayAdapter(activity, android.R.layout.simple_spinner_dropdown_item, options)
+            setSelection(currentIdx)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(
+                    parent: AdapterView<*>?, view: View?, position: Int, id: Long
+                ) {
+                    // 移除旧的 ORIENTATION 条件，再按选择添加
+                    rule.conditions.removeAll { it.type == EventType.ORIENTATION }
+                    if (position > 0) {
+                        val ori = allOrientations[position - 1]
+                        rule.conditions.add(EventCondition(EventType.ORIENTATION, ori.name))
+                    }
+                }
+                override fun onNothingSelected(parent: AdapterView<*>?) {}
+            }
+            layoutParams = LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+            )
+        }
+        row.addView(spinner)
+        container.addView(row)
+
+        // 说明：结构可扩展
+        container.addView(TextView(activity).apply {
+            text = "说明：附加条件在事件触发瞬间判定。当前仅支持\"当前方向\"，未来可扩展其他条件。"
+            textSize = 11f
+            setTextColor(Color.GRAY)
+            setPadding(0, 5, 0, 0)
+        })
+    }
+
+    // ==================== 底部操作 ====================
 
     private fun buildBottomBar(): View {
         val row = LinearLayout(activity).apply {

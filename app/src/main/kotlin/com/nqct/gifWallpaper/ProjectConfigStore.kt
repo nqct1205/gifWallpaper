@@ -5,35 +5,32 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
-/**
- * 项目配置加载 / 保存 / 与磁盘同步。
- *
- * 设计原则：
- *  - 持久化只存"用户配置"，不存解析缓存（[ResourceItem.info] 重新解析）。
- *  - 加载时与磁盘 GIF 列表做同步：新增文件补建资源、缺失文件移出资源并清理悬空引用。
- *  - JSON 损坏时返回错误，不静默覆盖磁盘。
- */
+// 项目配置加载 / 保存 / 与磁盘同步。
+// 持久化只存"用户配置"，不存解析缓存（ResourceItem.info 重新解析）。
+// 加载时与磁盘 GIF 列表同步：新增补建、缺失清理引用。
+// JSON 损坏返回 Corrupted，不静默覆盖磁盘。
 object ProjectConfigStore {
 
-    private const val CONFIG_FILE = "project.json"
-    private const val ANIM_DIR = "animations"
+    const val CONFIG_FILE = "project.json"
+    const val ANIM_DIR = "animations"
 
     sealed class LoadResult {
         data class Ok(val config: ProjectConfig) : LoadResult()
         data class Corrupted(val message: String) : LoadResult()
     }
 
-    /** 资源目录（filesDir/animations）。 */
     fun animDir(context: Context): File {
         val dir = File(context.filesDir, ANIM_DIR)
         if (!dir.exists()) dir.mkdirs()
         return dir
     }
 
+    fun configFile(context: Context): File = File(context.filesDir, CONFIG_FILE)
+
     // ==================== 加载 ====================
 
     fun load(context: Context): LoadResult {
-        val file = File(context.filesDir, CONFIG_FILE)
+        val file = configFile(context)
         val config = if (!file.exists()) {
             ProjectConfig()
         } else {
@@ -47,6 +44,16 @@ object ProjectConfigStore {
         }
         syncWithDisk(context, config)
         return LoadResult.Ok(config)
+    }
+
+    // 仅解析 JSON 文本，不写盘、不同步。用于导入前的格式验证。
+    fun parseOnly(text: String): ProjectConfig? {
+        if (text.isBlank()) return null
+        return try {
+            parse(JSONObject(text))
+        } catch (e: Exception) {
+            null
+        }
     }
 
     private fun parse(json: JSONObject): ProjectConfig {
@@ -123,16 +130,35 @@ object ProjectConfigStore {
         val evArr = json.optJSONArray("eventRules") ?: JSONArray()
         for (i in 0 until evArr.length()) {
             val obj = evArr.optJSONObject(i) ?: continue
+            val type = parseEventType(obj.optString("type", "ORIENTATION"))
+            val triggerParam = obj.optString("triggerParam", "")
+
+            // 旧版本方向规则（FORWARD / REVERSE）作废：直接丢弃
+            if (type == EventType.ORIENTATION && !isValidOrientationName(triggerParam)) {
+                continue
+            }
+
             val rule = EventRule(
                 id = obj.optString("id", "ev_$i"),
-                type = parseEventType(obj.optString("type", "ORIENTATION")),
-                triggerParam = obj.optString("triggerParam", ""),
+                type = type,
+                triggerParam = triggerParam,
                 targetStateId = obj.optString("targetStateId", "")
             )
             val srcArr = obj.optJSONArray("sourceStateIds") ?: JSONArray()
             for (j in 0 until srcArr.length()) {
                 val sid = srcArr.optString(j, "")
                 if (sid.isNotEmpty()) rule.sourceStateIds.add(sid)
+            }
+            // 附加条件（当前仅解析方向条件）
+            val condArr = obj.optJSONArray("conditions") ?: JSONArray()
+            for (j in 0 until condArr.length()) {
+                val cObj = condArr.optJSONObject(j) ?: continue
+                val cType = parseEventType(cObj.optString("type", "ORIENTATION"))
+                val cParam = cObj.optString("param", "")
+                if (cType == EventType.ORIENTATION && isValidOrientationName(cParam)) {
+                    rule.conditions.add(EventCondition(cType, cParam))
+                }
+                // 其他类型的条件暂不解析（未来扩展）
             }
             config.eventRules.add(rule)
         }
@@ -142,7 +168,6 @@ object ProjectConfigStore {
 
     // ==================== 保存 ====================
 
-    /** 保存到默认路径，返回是否成功。 */
     fun save(context: Context, config: ProjectConfig): Boolean {
         return try {
             val json = JSONObject()
@@ -213,11 +238,20 @@ object ProjectConfigStore {
                 val srcArr = JSONArray()
                 for (sid in e.sourceStateIds) srcArr.put(sid)
                 obj.put("sourceStateIds", srcArr)
+
+                val condArr = JSONArray()
+                for (c in e.conditions) {
+                    condArr.put(JSONObject().apply {
+                        put("type", c.type.name)
+                        put("param", c.param)
+                    })
+                }
+                obj.put("conditions", condArr)
                 evArr.put(obj)
             }
             json.put("eventRules", evArr)
 
-            File(context.filesDir, CONFIG_FILE).writeText(json.toString(4))
+            configFile(context).writeText(json.toString(4))
             true
         } catch (e: Exception) {
             e.printStackTrace()
@@ -227,13 +261,11 @@ object ProjectConfigStore {
 
     // ==================== 与磁盘同步 ====================
 
-    /**
-     * 用磁盘 GIF 列表刷新 [ProjectConfig.resources]：
-     *  1. 磁盘上新增的 GIF → 补建 ResourceItem 并解析元信息；
-     *  2. 磁盘上已删除的 GIF → 移除 ResourceItem，并清理引用它的 AnimationResourceRef；
-     *  3. 清理悬空的状态 / 事件规则引用；
-     *  4. 校验 defaultStateId。
-     */
+    // 用磁盘 GIF 列表刷新 resources：
+    //   1. 新增 GIF 补建 ResourceItem（并解析 info）
+    //   2. 缺失 GIF 移除 ResourceItem，清理引用它的 AnimationResourceRef
+    //   3. 清理悬空状态 / 事件规则引用
+    //   4. 校验 defaultStateId
     private fun syncWithDisk(context: Context, config: ProjectConfig) {
         val dir = animDir(context)
         val files = dir.listFiles { f -> f.extension.lowercase() == "gif" } ?: emptyArray()
@@ -270,7 +302,7 @@ object ProjectConfigStore {
         }
     }
 
-    // ==================== 枚举解析容错 ====================
+    // ==================== 解析工具 ====================
 
     private fun parseAnchor(name: String): AnchorPoint =
         runCatching { AnchorPoint.valueOf(name) }.getOrDefault(AnchorPoint.CENTER)
@@ -280,4 +312,10 @@ object ProjectConfigStore {
 
     private fun parseEventType(name: String): EventType =
         runCatching { EventType.valueOf(name) }.getOrDefault(EventType.ORIENTATION)
+
+    // 校验方向名是否合法（用于丢弃旧 FORWARD/REVERSE 与非法值）
+    private fun isValidOrientationName(name: String): Boolean {
+        if (name.isEmpty()) return false
+        return DeviceOrientation.values().any { it.name == name && it != DeviceOrientation.UNKNOWN }
+    }
 }

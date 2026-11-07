@@ -7,21 +7,11 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import java.util.Locale
 
-/**
- * 壁纸调试信息 / 错误信息的绘制器（无状态、无业务依赖）。
- */
+// 壁纸调试信息 / 错误信息的绘制器（无状态、无业务依赖）。
+// 显示文本（stateName / animationDisplay）由调用方传入已格式化的字符串。
 class DebugOverlayRenderer {
 
-    /**
-     * 调试面板数据快照。
-     *
-     * 【显示文本说明】[stateName] 与 [animationDisplay] 由调用方传入**已格式化**的字符串，
-     * 本类不做名字/id 拼接（保持绘制器与数据模型解耦）。
-     * 调用方（[GifWallpaperService.buildDebugState]）使用
-     * `formatStateDisplay` / `formatAnimDisplay` 生成"名字 (id)"格式。
-     */
     data class DebugState(
-        /** 状态的显示文本：名字 (id)；无状态时为 "None" */
         val stateName: String,
         val currentPlayCount: Int,
         val targetSelfPlay: Int,
@@ -34,21 +24,24 @@ class DebugOverlayRenderer {
         val frameIntervalMs: Long,
         val isAlarm: Boolean,
         val hasError: Boolean,
-        /** 帧索引是否为估算值（基于时间轴推算，非精确帧回调） */
         val frameIndexIsEstimate: Boolean = true,
-        /** 动画的显示文本：名字 (id)；无动画时为 "无" */
         val animationDisplay: String = "",
-        /** 传感器姿态文本 */
         val postureText: String = "",
-        /** 摇一摇冷却中 */
+        val lastShakeText: String = "无",
+        val gForce: Float = 0f,
+        val shakeThresholdG: Float = 2.4f,
+        val sensorStatus: String = "未注册",
         val isShaking: Boolean = false,
-        /** 当前触摸中 */
-        val isTouching: Boolean = false
+        val isTouching: Boolean = false,
+        // 计数器：用于诊断异常切换
+        val onAnimationEndCount: Int = 0,
+        val enterStateCount: Int = 0,
+        val cycleTimerCount: Int = 0
     )
 
     private val debugTextPaint = Paint().apply {
         color = Color.WHITE
-        textSize = 36f
+        textSize = 32f
         textAlign = Paint.Align.CENTER
         isAntiAlias = true
         typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
@@ -67,7 +60,6 @@ class DebugOverlayRenderer {
         typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     }
 
-    /** 绘制红字错误面板（画布中央偏上）。 */
     fun drawErrorInfo(canvas: Canvas, errorMsg: String) {
         if (errorMsg.isBlank()) return
 
@@ -100,7 +92,6 @@ class DebugOverlayRenderer {
         drawWrappedText(canvas, errorMsg, errorTextPaint, centerX, startY, maxWidth)
     }
 
-    /** 绘制调试信息面板。 */
     fun drawDebugInfo(canvas: Canvas, s: DebugState) {
         val warnSign = if (s.isAlarm) " [⚠ 超阈值]" else ""
 
@@ -109,10 +100,18 @@ class DebugOverlayRenderer {
             " 第 ${s.frameIndex + 1}/${s.frameCount} 帧$estimateMark"
         } else ""
 
-        val sensorText = buildString {
-            if (s.postureText.isNotEmpty()) append("\n姿态: ${s.postureText}")
+        val sensorLine = buildString {
+            append("\n姿态: ").append(s.postureText.ifEmpty { "未知" })
             if (s.isShaking) append("  [摇一摇冷却中]")
             if (s.isTouching) append("  [触摸中]")
+            append("\n最近摇一摇: ").append(s.lastShakeText)
+            append("  |  当前 ").append(String.format(Locale.US, "%.2f", s.gForce)).append("g")
+            append(" (阈值 ").append(String.format(Locale.US, "%.1f", s.shakeThresholdG)).append("g)")
+            append("\n传感器: ").append(s.sensorStatus)
+            // 诊断计数器：正常应缓慢增长；异常切换时 enterStateCount 会快速飙升
+            append("\n计数: enter=").append(s.enterStateCount)
+                .append("  timer=").append(s.cycleTimerCount)
+                .append("  animEnd=").append(s.onAnimationEndCount)
         }
 
         val memoryText = String.format(
@@ -122,7 +121,7 @@ class DebugOverlayRenderer {
             s.animationDisplay.ifEmpty { "无" },
             s.drawTimeMs, s.limitDrawTime,
             s.currentMemMb, s.limitMemory, s.frameIntervalMs,
-            sensorText
+            sensorLine
         )
 
         val maxWidth = canvas.width * 0.9f

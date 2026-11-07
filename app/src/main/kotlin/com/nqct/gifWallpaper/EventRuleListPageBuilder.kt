@@ -10,12 +10,9 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 
-/**
- * 事件规则列表页。
- *
- * 【展示】每条规则的事件类型、触发参数、触发状态集（显示“状态名 (id)”）、目标状态（同）。
- * 【触发状态集】空集显示“任意状态”。
- */
+// 事件规则列表页。
+// 展示：事件类型（含方向参数）、附加条件、触发状态集、目标状态。
+// 触发状态集为空时显示"任意状态"。
 class EventRuleListPageBuilder(
     private val activity: Activity,
     private val config: ProjectConfig,
@@ -36,7 +33,7 @@ class EventRuleListPageBuilder(
             setBackgroundColor(Color.parseColor("#F5F5F5"))
         }
 
-        // ---- 顶栏 ----
+        // 顶栏
         val topBar = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -53,16 +50,16 @@ class EventRuleListPageBuilder(
         })
         root.addView(topBar)
 
-        // ---- 说明 ----
+        // 说明
         root.addView(TextView(activity).apply {
-            text = "事件规则：当指定事件触发时，若当前状态在触发状态集中，则跳转到目标状态。\n" +
-                "触发状态集为空表示“任意状态”。"
+            text = "事件规则：当主事件触发、且附加条件满足时，若当前状态在触发状态集中，则跳转到目标状态。\n" +
+                "触发状态集为空表示“任意状态”；无附加条件表示无条件。"
             textSize = 12f
             setTextColor(Color.GRAY)
             setPadding(0, 10, 0, 10)
         })
 
-        // ---- 新建 ----
+        // 新建
         root.addView(Button(activity).apply {
             text = "新建事件规则"
             setBackgroundColor(Color.parseColor("#4CAF50"))
@@ -70,7 +67,7 @@ class EventRuleListPageBuilder(
             setOnClickListener { callbacks.onCreateRule() }
         }, matchWrap(top = 10, bottom = 20))
 
-        // ---- 列表 ----
+        // 列表
         if (config.eventRules.isEmpty()) {
             root.addView(TextView(activity).apply {
                 text = "暂无事件规则。"
@@ -114,6 +111,18 @@ class EventRuleListPageBuilder(
         })
         card.addView(headerRow)
 
+        // 附加条件（若有）
+        val conditionText = conditionLabel(rule)
+        if (conditionText.isNotEmpty()) {
+            card.addView(TextView(activity).apply {
+                text = "附加条件: $conditionText"
+                textSize = 12f
+                setTextColor(Color.parseColor("#FF6D00"))
+                setPadding(0, 5, 0, 0)
+            })
+        }
+
+        // 触发状态 → 目标状态
         val sourceText = if (rule.sourceStateIds.isEmpty()) {
             "任意状态"
         } else {
@@ -136,18 +145,29 @@ class EventRuleListPageBuilder(
         return card
     }
 
+    // 事件标题：方向事件显示 6 方向之一，其他显示类型名。
     private fun typeLabel(rule: EventRule): String {
-        val typeName = rule.type.label
         return when (rule.type) {
             EventType.ORIENTATION -> {
-                val param = when (rule.triggerParam) {
-                    EventRule.ORIENTATION_FORWARD -> "正向"
-                    EventRule.ORIENTATION_REVERSE -> "反向"
-                    else -> "未设置"
-                }
-                "$typeName（$param）"
+                val ori = DeviceOrientation.values().firstOrNull { it.name == rule.triggerParam }
+                val dir = ori?.label ?: "未设置"
+                "${rule.type.label}（变为 $dir）"
             }
-            else -> typeName
+            else -> rule.type.label
+        }
+    }
+
+    // 附加条件描述。当前仅 ORIENTATION 类型。
+    private fun conditionLabel(rule: EventRule): String {
+        if (rule.conditions.isEmpty()) return ""
+        return rule.conditions.joinToString("、") { c ->
+            when (c.type) {
+                EventType.ORIENTATION -> {
+                    val ori = DeviceOrientation.values().firstOrNull { it.name == c.param }
+                    "方向 = ${ori?.label ?: c.param}"
+                }
+                else -> c.type.label
+            }
         }
     }
 

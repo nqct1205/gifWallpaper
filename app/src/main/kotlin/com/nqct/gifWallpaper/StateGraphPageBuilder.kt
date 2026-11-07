@@ -13,22 +13,14 @@ import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 
-/**
- * 状态图页面。
- *
- * 【布局】
- *  - 顶部栏：返回 + 标题 + 重置视图。
- *  - 中部：[StateGraphView]（占满剩余空间，支持拖动缩放双击）。
- *  - 底部：事件规则框列表（水平滚动）。
- *
- * 【交互】
- *  - 单击事件框：通知 [StateGraphView] 高亮该事件；再单击同一框取消高亮。
- *  - 单击图区空白：清除事件高亮。
- *  - 双击节点：回调 [Callbacks.onNodeDoubleTap]。
- *  - 双击事件框：回调 [Callbacks.onEventDoubleTap]。
- *
- * 【双击事件框实现】用 [GestureDetector] 接管触摸，避免单击和双击冲突。
- */
+// 状态图页面。
+// 布局：顶栏（返回 + 标题 + 重置视图）/ 中部 StateGraphView / 底部事件规则框列表。
+// 交互：
+//   - 单击事件框：StateGraphView 高亮该事件；再单击同一框取消高亮。
+//   - 单击图区空白：清除事件高亮。
+//   - 双击节点：onNodeDoubleTap 回调。
+//   - 双击事件框：onEventDoubleTap 回调。
+// 双击事件框用 GestureDetector 接管触摸，区分单击与双击。
 class StateGraphPageBuilder(
     private val activity: Activity,
     private val config: ProjectConfig,
@@ -41,7 +33,7 @@ class StateGraphPageBuilder(
         fun onEventDoubleTap(ruleId: String)
     }
 
-    /** 事件框列表：用于高亮切换时刷新所有框的背景。 */
+    // 事件框列表：用于高亮切换时刷新所有框的背景
     private val eventBoxes = mutableListOf<Pair<EventRule, View>>()
 
     fun build(): View {
@@ -60,7 +52,7 @@ class StateGraphPageBuilder(
             )
         }
 
-        // ---- 顶栏 ----
+        // 顶栏
         val topBar = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -84,13 +76,13 @@ class StateGraphPageBuilder(
         })
         root.addView(topBar)
 
-        // ---- 中部状态图 ----
+        // 中部状态图
         root.addView(graphView)
 
-        // ---- 底部事件规则区 ----
+        // 底部事件规则区
         root.addView(buildEventSection(graphView))
 
-        // ---- 数据 & 回调 ----
+        // 数据 & 回调
         graphView.setData(
             config.states.values.toList(),
             config.animations,
@@ -164,6 +156,17 @@ class StateGraphPageBuilder(
             setTextColor(Color.BLACK)
         })
 
+        // 附加条件（若有）
+        val condText = conditionText(rule)
+        if (condText.isNotEmpty()) {
+            box.addView(TextView(activity).apply {
+                text = condText
+                textSize = 11f
+                setTextColor(Color.parseColor("#FF6D00"))
+                setPadding(0, 3, 0, 0)
+            })
+        }
+
         // 目标状态
         val targetText = if (rule.targetStateId.isEmpty()) {
             "未设置"
@@ -182,7 +185,6 @@ class StateGraphPageBuilder(
             override fun onDown(e: MotionEvent): Boolean = true
 
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
-                // 同一框再点一次：取消高亮
                 if (graphView.highlightedEventRule?.id == rule.id) {
                     graphView.setHighlightedEventRule(null)
                 } else {
@@ -202,7 +204,7 @@ class StateGraphPageBuilder(
         return box
     }
 
-    /** 根据当前高亮规则刷新所有事件框的视觉（高亮橙色背景/边框）。 */
+    // 根据当前高亮规则刷新所有事件框的视觉（高亮橙色背景/边框）。
     private fun refreshEventBoxVisuals(graphView: StateGraphView) {
         val highlighted = graphView.highlightedEventRule?.id
         for ((rule, box) in eventBoxes) {
@@ -214,18 +216,31 @@ class StateGraphPageBuilder(
         }
     }
 
+    // 事件标题：方向事件显示 6 方向之一，其他显示类型名。
     private fun eventTitle(rule: EventRule): String {
         return when (rule.type) {
             EventType.ORIENTATION -> {
-                val dir = when (rule.triggerParam) {
-                    EventRule.ORIENTATION_FORWARD -> "正向"
-                    EventRule.ORIENTATION_REVERSE -> "反向"
-                    else -> ""
-                }
-                "方向改变（$dir）"
+                val ori = DeviceOrientation.values().firstOrNull { it.name == rule.triggerParam }
+                val dir = ori?.label ?: "未设置"
+                "${rule.type.label}（变为 $dir）"
             }
             EventType.SHAKE -> "摇一摇"
             EventType.CLICK -> "点击"
         }
+    }
+
+    // 附加条件描述。当前仅 ORIENTATION 类型。
+    private fun conditionText(rule: EventRule): String {
+        if (rule.conditions.isEmpty()) return ""
+        val parts = rule.conditions.mapNotNull { c ->
+            when (c.type) {
+                EventType.ORIENTATION -> {
+                    val ori = DeviceOrientation.values().firstOrNull { it.name == c.param }
+                    "方向=${ori?.label ?: c.param}"
+                }
+                else -> null
+            }
+        }
+        return if (parts.isEmpty()) "" else parts.joinToString("、")
     }
 }

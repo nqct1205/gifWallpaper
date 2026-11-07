@@ -1,31 +1,13 @@
 package com.nqct.gifWallpaper
 
-/**
- * 项目全量数据模型。
- *
- * 分层关系：
- *   ResourceItem  ←  AnimationResourceRef  ←  AnimationItem  ←  StateNode
- *   （磁盘 GIF）     （动画内的资源引用）      （动画）          （状态）
- *
- * 引用规则：
- *  - 一个状态引用一个动画（1:1）。
- *  - 一个动画可被多个状态引用（1:N）。
- *  - 一个动画可包含多个资源引用（1:N）。
- *  - 一个资源可被多个动画引用（1:N）。
- */
+// 项目全量数据模型。
+// 分层：ResourceItem <- AnimationResourceRef <- AnimationItem <- StateNode
+// 引用：1 状态 -> 1 动画；1 动画 -> N 资源引用；1 资源 <- N 动画引用。
 
 // ==================== 资源层 ====================
 
-/**
- * 磁盘上的 GIF 静态资源。
- *
- * 【重要】所有字段均由文件本身决定，用户**不可修改**。
- * 用户对"播放时如何定位、如何缩放"的配置属于 [AnimationResourceRef]，不属于本类。
- *
- * @param id        稳定标识（文件名去后缀），同时作为磁盘文件名主体
- * @param fileName  完整磁盘文件名（含 .gif）
- * @param info      解析得到的元信息；解析失败时为 null
- */
+// 磁盘上的 GIF 静态资源。所有字段由文件决定，用户不可修改。
+// 播放时的定位/缩放属于 AnimationResourceRef，不属于本类。
 data class ResourceItem(
     val id: String,
     val fileName: String,
@@ -34,16 +16,8 @@ data class ResourceItem(
 
 // ==================== 9 点定位 ====================
 
-/**
- * GIF 资源上的 9 个锚点。
- *
- * 语义：
- *  - 平移：把该锚点平移到目标位置（如屏幕底部中点）。
- *  - 缩放：以该锚点为中心缩放。
- *  - 归一化坐标 (0f,0f) 为资源左上角，(1f,1f) 为右下角。
- *
- * 这两个用途都只是数学运算，不改变资源本身。
- */
+// GIF 资源上的 9 个锚点，作为平移目标点与缩放中心。
+// 归一化坐标：(0,0) 左上，(1,1) 右下。
 enum class AnchorPoint(val label: String) {
     TOP_LEFT("左上"),
     TOP_CENTER("上中"),
@@ -55,7 +29,6 @@ enum class AnchorPoint(val label: String) {
     BOTTOM_CENTER("下中"),
     BOTTOM_RIGHT("右下");
 
-    /** 归一化坐标：x 向右为正，y 向下为正，范围 0..1 */
     fun normalized(): Pair<Float, Float> = when (this) {
         TOP_LEFT      -> 0f   to 0f
         TOP_CENTER    -> 0.5f to 0f
@@ -71,34 +44,19 @@ enum class AnchorPoint(val label: String) {
 
 // ==================== 缩放模式 ====================
 
-/**
- * 缩放模式。
- *  - [PERCENT]：[AnimationResourceRef.scaleValue] 表示相对原始尺寸的百分比（100 = 原始大小）。
- *  - [PIXEL]  ：[AnimationResourceRef.scaleValue] 表示目标**宽度**像素；高度按原始宽高比自动换算。
- *
- * 之所以只存一个数值：比例与像素可互相换算，无需冗余存储，避免二者冲突。
- */
+// PERCENT：scaleValue 是相对原始尺寸的百分比（100 = 原始大小）。
+// PIXEL：scaleValue 是目标宽度像素，高度按原始宽高比换算。
 enum class ScaleMode { PERCENT, PIXEL }
 
 // ==================== 动画内的资源引用 ====================
 
-/**
- * 动画项对某个资源的一次引用。
- *
- * 【重要】定位点与缩放是**动画自己的属性**，不是资源属性。
- * 同一个资源可被不同动画以不同定位 / 缩放引用。
- *
- * @param resourceId 引用的 [ResourceItem.id]
- * @param anchor     9 点锚点：决定 GIF 的哪个点参与对齐 / 缩放中心
- * @param targetAnchor 9 点目标锚点：决定 GIF 的 anchor 对齐到屏幕的哪个位置
- * @param scaleMode  缩放模式
- * @param scaleValue PERCENT 时为百分比；PIXEL 时为目标宽度像素
- * @param offsetX    在锚点对齐后的额外水平微调（像素，正向右）
- * @param offsetY    在锚点对齐后的额外垂直微调（像素，正向下）
- */
+// 定位/缩放是动画的属性，不是资源的属性。
+// 同一资源可被不同动画以不同定位/缩放引用。
 data class AnimationResourceRef(
     var resourceId: String = "",
+    // GIF 上的锚点：决定 GIF 的哪个点参与对齐 / 缩放中心
     var anchor: AnchorPoint = AnchorPoint.CENTER,
+    // 屏幕目标锚点：决定 GIF 的 anchor 对齐到屏幕的哪个位置
     var targetAnchor: AnchorPoint = AnchorPoint.CENTER,
     var scaleMode: ScaleMode = ScaleMode.PERCENT,
     var scaleValue: Float = 100f,
@@ -108,25 +66,13 @@ data class AnimationResourceRef(
 
 // ==================== 动画层 ====================
 
-/**
- * 动画项：一组资源的集合。
- *
- * 【当前处理逻辑（简化版）】
- *  - 一个动画内的多个资源**同时开始播放、同时绘制**。
- *  - 之所以这样处理：用户常见用法是"复用同一个动画多遍"，各资源长度一致，
- *    统一按主资源（第一个）的帧时间轴驱动即可。
- *  - 若各资源长度不一致，当前以**最短**的为准（见 [GifWallpaperService]）。
- *
- * 【后续可能扩展】
- *  - 不同资源独立的起播偏移 / 时间轴。
- *  - 按帧索引手动控制（替代多个 [android.graphics.drawable.AnimatedImageDrawable] 实例）。
- *
- * @param name            用户可编辑的名称。展示时优先使用；为空时回退到 [id]。
- * @param backgroundColor 背景填充色。十六进制字符串（`#RRGGBB` 或 `#AARRGGBB`）。
- *                        空字符串表示不自定义，渲染时回退为黑色。
- *                        无论用户以手动输入 / 吸管 / 参考色块哪种方式设置，
- *                        最终都存储为该字符串；手动输入在失焦时规范化。
- */
+// 动画项：一组资源引用。
+// 当前简化：同一动画内多个资源同时开始、同时绘制，以第一个资源（主实例）的
+// onAnimationEnd 作为一圈结束信号；各资源长度不一致时按最短者计。
+// 后续可改为手动帧索引控制（共享解码数据，各自控制进度）。
+//
+// name：用户可编辑，展示时优先使用；为空时回退到 id。
+// backgroundColor：十六进制字符串（#RRGGBB 或 #AARRGGBB）；空串 = 不自定义，回退黑色。
 data class AnimationItem(
     var id: String = "",
     var name: String = "",
@@ -136,31 +82,15 @@ data class AnimationItem(
 
 // ==================== 状态与转移规则 ====================
 
-/**
- * 按权重随机转移的规则。
- * @param targetStateId 目标状态 ID
- * @param weight        权重（>=0；0 表示不会被抽到）
- */
+// 按权重随机转移的规则。weight = 0 表示不会被抽到。
 data class TransitionRule(
     var targetStateId: String = "",
     var weight: Int = 1
 )
 
-/**
- * 状态节点：引用一个动画 + 周期范围 + 概率转移规则。
- *
- * @param id          稳定标识。**不可修改**：转移规则、事件规则、默认状态都以它为引用键。
- * @param name        用户可编辑的名称。展示时优先使用；为空或与 [id] 相同时回退到 [id]。
- * @param animationId 引用的 [AnimationItem.id]
- * @param periodMin   进入状态时随机抽取的周期下限（圈数）
- * @param periodMax   周期上限（圈数）
- *
- * 【周期语义】当前“周期”= 还要播放所引用动画多少**圈**。
- * 每播完一圈减 1；减到 0 触发概率转移。进入状态时从 [periodMin, periodMax] 随机取值。
- *
- * 【后续可能扩展】周期改为时长；或状态内不同动画各有独立周期。
- * 当前因状态引用多个动画时各动画长度一致，统一按圈数计。
- */
+// 状态节点：引用一个动画 + 周期范围 + 概率转移规则。
+// id 不可改（引用键）；name 用户可编辑，仅展示用。
+// 周期 = 进入状态时从 [periodMin, periodMax] 随机抽取的目标圈数。
 data class StateNode(
     var id: String = "",
     var name: String = "",
@@ -170,54 +100,77 @@ data class StateNode(
     var rules: MutableList<TransitionRule> = mutableListOf()
 )
 
+// ==================== 设备方向 ====================
+
+// 手机在空间中的 6 个朝向，外加未知/临界状态。
+// 基于重力在设备坐标系的归一化分量判定：
+//   平放：|gz| > 0.7
+//   竖持：|gz| <= 0.7 且 |gy| > 0.7
+//   横持：|gz| <= 0.7 且 |gy| <= 0.7 且 |gx| > 0.7
+//   否则 UNKNOWN（临界/斜握）
+// 物理含义：
+//   SCREEN_UP      屏幕朝上（正面朝上）
+//   SCREEN_DOWN    屏幕朝下（背面朝上）
+//   PORTRAIT       竖屏（顶部朝上）
+//   PORTRAIT_REVERSED 竖屏倒置（顶部朝下）
+//   LANDSCAPE_LEFT 横屏（顶部朝左）
+//   LANDSCAPE_RIGHT 横屏（顶部朝右）
+enum class DeviceOrientation(val label: String) {
+    SCREEN_UP("屏幕朝上"),
+    SCREEN_DOWN("屏幕朝下"),
+    PORTRAIT("竖屏"),
+    PORTRAIT_REVERSED("竖屏倒置"),
+    LANDSCAPE_LEFT("横屏(顶部朝左)"),
+    LANDSCAPE_RIGHT("横屏(顶部朝右)"),
+    UNKNOWN("未知");
+}
+
 // ==================== 事件规则 ====================
 
-/** 支持的外部事件类型。 */
+// 支持的外部事件类型。
 enum class EventType(val label: String) {
     ORIENTATION("手机方向改变"),
     SHAKE("摇一摇"),
     CLICK("点击")
 }
 
-/**
- * 事件驱动规则。
- *
- * 【当前处理逻辑】**确定性**：只要事件匹配，且当前状态在 [sourceStateIds] 中，
- * 就跳转到 [targetStateId]，不经过权重随机。
- *
- * 【后续可能扩展】为事件规则也增加概率 / 多目标，实现“按概率跳不同状态或干脆不跳”。
- * 当前先保持确定性，逻辑简单且易于用户理解。
- *
- * @param type          事件类型
- * @param triggerParam  触发条件参数：
- *                      - ORIENTATION: [ORIENTATION_FORWARD] / [ORIENTATION_REVERSE]
- *                      - SHAKE / CLICK: 忽略
- * @param sourceStateIds 触发状态集合；**空集合表示“任意状态”**
- * @param targetStateId  目标状态 ID
- */
+// 附加条件：事件触发瞬间需满足的快照条件。
+// 当前仅支持 ORIENTATION 类型（param = DeviceOrientation.name）；
+// 结构上为未来扩展预留（如电量、时间、当前状态等）。
+data class EventCondition(
+    var type: EventType = EventType.ORIENTATION,
+    var param: String = ""
+)
+
+// 事件驱动规则。
+//
+// 匹配流程：
+//   1. 主事件（type + triggerParam）匹配
+//   2. 当前状态在 sourceStateIds 中（空 = 任意状态）
+//   3. 所有 conditions 在当前快照下满足
+//   全部通过则跳转到 targetStateId。
+//
+// triggerParam：
+//   - ORIENTATION: DeviceOrientation.name（如 "PORTRAIT"），语义为"变为该方向"
+//   - SHAKE / CLICK: 忽略
+//
+// conditions：附加条件列表，每项独立判定（AND 关系）。
+// 当前仅支持方向条件：param = DeviceOrientation.name，比较"事件触发瞬间的方向"。
+//
+// 后续可扩展：为规则增加概率 / 多目标，实现"按概率跳不同状态或干脆不跳"。
 data class EventRule(
     var id: String = "",
     var type: EventType = EventType.ORIENTATION,
     var triggerParam: String = "",
+    var conditions: MutableList<EventCondition> = mutableListOf(),
     var sourceStateIds: MutableList<String> = mutableListOf(),
     var targetStateId: String = ""
-) {
-    companion object {
-        /** 正向放置（屏幕朝上） */
-        const val ORIENTATION_FORWARD = "FORWARD"
-        /** 反向放置（屏幕朝下） */
-        const val ORIENTATION_REVERSE = "REVERSE"
-    }
-}
+)
 
 // ==================== 项目总配置 ====================
 
-/**
- * 项目根配置。所有子表按 id 索引，便于 O(1) 查找与引用完整性校验。
- *
- * 持久化到 filesDir/project.json。
- * [ResourceItem.info] 是解析缓存，**不写入 JSON**，加载时重新解析磁盘文件。
- */
+// 项目根配置，所有子表按 id 索引。
+// 持久化到 filesDir/project.json；ResourceItem.info 是解析缓存，不写入 JSON。
 class ProjectConfig {
     var defaultStateId: String = ""
     val resources = mutableMapOf<String, ResourceItem>()
@@ -225,7 +178,7 @@ class ProjectConfig {
     val states = mutableMapOf<String, StateNode>()
     val eventRules = mutableListOf<EventRule>()
 
-    /** 引用完整性检查，返回发现的问题列表（空表示健康）。 */
+    // 引用完整性检查，返回问题列表（空表示健康）。
     fun validate(): List<String> {
         val issues = mutableListOf<String>()
 

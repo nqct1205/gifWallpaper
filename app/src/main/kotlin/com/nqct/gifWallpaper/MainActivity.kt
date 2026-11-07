@@ -15,20 +15,16 @@ import android.widget.ScrollView
 import android.widget.Toast
 import java.io.File
 import java.io.FileOutputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 
-/**
- * 应用入口 Activity。
- *
- * 【职责】
- *  - 持有唯一 [ProjectConfig] 实例。
- *  - 页面路由（[Page] sealed class + [showPage]）。
- *  - 保存配置（[saveConfig]）。
- *  - 系统级操作（导入 GIF、应用壁纸）。
- *
- * 【返回来源】部分编辑页（状态 / 事件规则）可能从不同入口进入，
- * 通过 [Page.StateEdit.returnTo] / [Page.EventRuleEdit.returnTo] 记录来源页，
- * 页内“< 返回”与系统返回键均回到该来源。
- */
+// 应用入口 Activity。
+// 职责：持有 ProjectConfig、页面路由、保存配置、系统级操作
+// （导入 GIF / 应用壁纸 / 恢复系统默认壁纸 / 数据备份导入导出）。
+// 部分编辑页通过 Page.StateEdit.returnTo / Page.EventRuleEdit.returnTo 记录来源页，
+// 页内返回与系统返回键均回到该来源。
+// 导入 JSON / 压缩包在写入磁盘前先做格式与资源完整性验证，失败时原数据保持不变。
 class MainActivity : Activity() {
 
     private var config = ProjectConfig()
@@ -41,33 +37,29 @@ class MainActivity : Activity() {
         object AnimationList : Page()
         data class AnimationEdit(val animationId: String) : Page()
         object StateList : Page()
-
-        /**
-         * 状态编辑页。
-         * @param returnTo 返回目标。默认回到状态列表；从状态图双击进入时为 [StateGraph]。
-         */
+        // returnTo 默认回到状态列表；从状态图双击进入时为 StateGraph。
         data class StateEdit(
             val stateId: String,
             val returnTo: Page = StateList
         ) : Page()
-
         object EventRuleList : Page()
-
-        /**
-         * 事件规则编辑页。
-         * @param ruleId   null 表示新建。
-         * @param returnTo 返回目标。默认回到事件规则列表；从状态图双击进入时为 [StateGraph]。
-         */
+        // ruleId 为 null 表示新建；returnTo 默认回到事件规则列表。
         data class EventRuleEdit(
             val ruleId: String?,
             val returnTo: Page = EventRuleList
         ) : Page()
-
         object StateGraph : Page()
     }
 
     companion object {
         private const val REQ_IMPORT_GIF = 200
+        private const val REQ_EXPORT_JSON = 201
+        private const val REQ_EXPORT_ZIP = 202
+        private const val REQ_IMPORT_JSON = 203
+        private const val REQ_IMPORT_ZIP = 204
+
+        private const val ZIP_ENTRY_CONFIG = ProjectConfigStore.CONFIG_FILE
+        private const val ZIP_ENTRY_ANIM_DIR = ProjectConfigStore.ANIM_DIR
     }
 
     // ==================== 生命周期 ====================
@@ -80,12 +72,6 @@ class MainActivity : Activity() {
         showPage(Page.Main)
     }
 
-    /**
-     * 分版本注册返回键处理。
-     *
-     * - API 33+：通过 [OnBackInvokedDispatcher] 注册回调，替代已废弃的 onBackPressed。
-     * - API 26–32：走 [onBackPressed]（仍需保留）。
-     */
     private fun registerBackHandler() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             onBackInvokedDispatcher.registerOnBackInvokedCallback(
@@ -104,10 +90,6 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * API 26–32 的返回键入口。
-     * API 33+ 已由 [registerBackHandler] 注册的 OnBackInvokedCallback 接管。
-     */
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
@@ -115,14 +97,6 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * 统一的返回导航处理。
-     *
-     * - 主页面：退出 Activity（API 33+ 用 finish；低版本调 super.onBackPressed）。
-     * - 状态 / 事件规则编辑页：回到 [Page.StateEdit.returnTo] / [Page.EventRuleEdit.returnTo]，
-     *   离开前先 [saveConfig]，与页内“< 返回”按钮一致。
-     * - 其他页面：回主页面。
-     */
     private fun handleBackNavigation() {
         val cur = currentPage
         val back: Page? = when (cur) {
@@ -181,7 +155,6 @@ class MainActivity : Activity() {
             is Page.EventRuleEdit -> buildEventRuleEditPage(page)
             is Page.StateGraph -> buildStateGraphPage()
         }
-        // 状态图页面自带拖动/缩放，必须全屏且不能包 ScrollView（否则手势冲突）
         if (page is Page.StateGraph) {
             setContentView(content)
         } else {
@@ -189,18 +162,23 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun buildMainPage() = MainPageBuilder(
+    private fun buildMainPage(): android.view.View = MainPageBuilder(
         activity = this,
         config = config,
         warningMessage = lastWarning,
         callbacks = object : MainPageBuilder.Callbacks {
-            override fun onOpenResources() = showPage(Page.ResourceList)
-            override fun onOpenAnimations() = showPage(Page.AnimationList)
-            override fun onOpenStates() = showPage(Page.StateList)
-            override fun onOpenEventRules() = showPage(Page.EventRuleList)
-            override fun onOpenStateGraph() = showPage(Page.StateGraph)
-            override fun onSetDefaultState() = showDefaultStateDialog()
-            override fun onApplyWallpaper() = applyWallpaper()
+            override fun onOpenResources() { showPage(Page.ResourceList) }
+            override fun onOpenAnimations() { showPage(Page.AnimationList) }
+            override fun onOpenStates() { showPage(Page.StateList) }
+            override fun onOpenEventRules() { showPage(Page.EventRuleList) }
+            override fun onOpenStateGraph() { showPage(Page.StateGraph) }
+            override fun onSetDefaultState() { showDefaultStateDialog() }
+            override fun onApplyWallpaper() { applyWallpaper() }
+            override fun onRestoreSystemWallpaper() { confirmRestoreSystemWallpaper() }
+            override fun onExportJson() { startExportJson() }
+            override fun onExportZip() { startExportZip() }
+            override fun onImportJson() { confirmImport("导入 JSON") { startImportJson() } }
+            override fun onImportZip() { confirmImport("导入压缩包") { startImportZip() } }
         }
     ).build()
 
@@ -208,9 +186,9 @@ class MainActivity : Activity() {
         activity = this,
         config = config,
         callbacks = object : ResourceListPageBuilder.Callbacks {
-            override fun onBack() = showPage(Page.Main)
-            override fun onImportGif() = selectGif()
-            override fun onDeleteResource(resourceId: String) = deleteResource(resourceId)
+            override fun onBack() { showPage(Page.Main) }
+            override fun onImportGif() { selectGif() }
+            override fun onDeleteResource(resourceId: String) { deleteResource(resourceId) }
         }
     ).build()
 
@@ -218,10 +196,10 @@ class MainActivity : Activity() {
         activity = this,
         config = config,
         callbacks = object : AnimationListPageBuilder.Callbacks {
-            override fun onBack() = showPage(Page.Main)
-            override fun onCreateAnimation() = createNewAnimation()
-            override fun onEditAnimation(animationId: String) = showPage(Page.AnimationEdit(animationId))
-            override fun onDeleteAnimation(animationId: String) = deleteAnimation(animationId)
+            override fun onBack() { showPage(Page.Main) }
+            override fun onCreateAnimation() { createNewAnimation() }
+            override fun onEditAnimation(animationId: String) { showPage(Page.AnimationEdit(animationId)) }
+            override fun onDeleteAnimation(animationId: String) { deleteAnimation(animationId) }
         }
     ).build()
 
@@ -237,7 +215,7 @@ class MainActivity : Activity() {
             override fun onSaved() {
                 if (saveConfig()) showPage(Page.AnimationList)
             }
-            override fun onDelete() = deleteAnimation(animationId)
+            override fun onDelete() { deleteAnimation(animationId) }
         }
     ).build()
 
@@ -245,10 +223,10 @@ class MainActivity : Activity() {
         activity = this,
         config = config,
         callbacks = object : StateListPageBuilder.Callbacks {
-            override fun onBack() = showPage(Page.Main)
-            override fun onCreateState() = createNewState()
-            override fun onEditState(stateId: String) = showPage(Page.StateEdit(stateId))
-            override fun onDeleteState(stateId: String) = deleteState(stateId)
+            override fun onBack() { showPage(Page.Main) }
+            override fun onCreateState() { createNewState() }
+            override fun onEditState(stateId: String) { showPage(Page.StateEdit(stateId)) }
+            override fun onDeleteState(stateId: String) { deleteState(stateId) }
             override fun onSetDefault(stateId: String) {
                 config.defaultStateId = stateId
                 saveConfig()
@@ -257,10 +235,6 @@ class MainActivity : Activity() {
         }
     ).build()
 
-    /**
-     * 状态编辑页。
-     * 返回目标由 [Page.StateEdit.returnTo] 决定：状态列表 或 状态图。
-     */
     private fun buildStateEditPage(page: Page.StateEdit) = StateEditPageBuilder(
         activity = this,
         config = config,
@@ -273,8 +247,7 @@ class MainActivity : Activity() {
             override fun onSaved() {
                 if (saveConfig()) showPage(page.returnTo)
             }
-            // 删除状态后统一回到状态列表：状态图可能因删除后变空而不适合作为返回目标
-            override fun onDelete() = deleteState(page.stateId)
+            override fun onDelete() { deleteState(page.stateId) }
         }
     ).build()
 
@@ -282,17 +255,13 @@ class MainActivity : Activity() {
         activity = this,
         config = config,
         callbacks = object : EventRuleListPageBuilder.Callbacks {
-            override fun onBack() = showPage(Page.Main)
-            override fun onCreateRule() = showPage(Page.EventRuleEdit(null))
-            override fun onEditRule(ruleId: String) = showPage(Page.EventRuleEdit(ruleId))
-            override fun onDeleteRule(ruleId: String) = deleteEventRule(ruleId)
+            override fun onBack() { showPage(Page.Main) }
+            override fun onCreateRule() { showPage(Page.EventRuleEdit(null)) }
+            override fun onEditRule(ruleId: String) { showPage(Page.EventRuleEdit(ruleId)) }
+            override fun onDeleteRule(ruleId: String) { deleteEventRule(ruleId) }
         }
     ).build()
 
-    /**
-     * 事件规则编辑页。
-     * 返回目标由 [Page.EventRuleEdit.returnTo] 决定：事件规则列表 或 状态图。
-     */
     private fun buildEventRuleEditPage(page: Page.EventRuleEdit) = EventRuleEditPageBuilder(
         activity = this,
         config = config,
@@ -311,16 +280,11 @@ class MainActivity : Activity() {
         }
     ).build()
 
-    /**
-     * 状态图页面。
-     * 双击节点 / 事件框进入对应编辑页时，[returnTo] 设为 [Page.StateGraph]，
-     * 编辑完成后返回状态图而非列表页。
-     */
     private fun buildStateGraphPage() = StateGraphPageBuilder(
         activity = this,
         config = config,
         callbacks = object : StateGraphPageBuilder.Callbacks {
-            override fun onBack() = showPage(Page.Main)
+            override fun onBack() { showPage(Page.Main) }
             override fun onNodeDoubleTap(stateId: String) {
                 showPage(Page.StateEdit(stateId, returnTo = Page.StateGraph))
             }
@@ -330,7 +294,236 @@ class MainActivity : Activity() {
         }
     ).build()
 
-    // ==================== 资源操作 ====================
+    // ==================== 数据备份：导出 ====================
+
+    private fun startExportJson() {
+        saveConfig()
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/json"
+            putExtra(Intent.EXTRA_TITLE, "gif_wallpaper_config.json")
+        }
+        startActivityForResult(intent, REQ_EXPORT_JSON)
+    }
+
+    private fun startExportZip() {
+        saveConfig()
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/zip"
+            putExtra(Intent.EXTRA_TITLE, "gif_wallpaper_backup.zip")
+        }
+        startActivityForResult(intent, REQ_EXPORT_ZIP)
+    }
+
+    private fun exportJsonTo(uri: Uri) {
+        try {
+            val src = ProjectConfigStore.configFile(this)
+            if (!src.exists()) throw IllegalStateException("配置文件不存在")
+            contentResolver.openOutputStream(uri)?.use { output ->
+                src.inputStream().use { input -> input.copyTo(output) }
+            } ?: throw IllegalStateException("无法写入目标文件")
+            Toast.makeText(this, "JSON 导出成功", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "导出失败: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun exportZipTo(uri: Uri) {
+        try {
+            val configFile = ProjectConfigStore.configFile(this)
+            if (!configFile.exists()) throw IllegalStateException("配置文件不存在")
+
+            contentResolver.openOutputStream(uri)?.use { output ->
+                ZipOutputStream(output).use { zip ->
+                    zip.putNextEntry(ZipEntry(ZIP_ENTRY_CONFIG))
+                    configFile.inputStream().use { it.copyTo(zip) }
+                    zip.closeEntry()
+
+                    val animDir = ProjectConfigStore.animDir(this)
+                    val gifs = animDir.listFiles { f -> f.extension.lowercase() == "gif" } ?: emptyArray()
+                    for (gif in gifs) {
+                        zip.putNextEntry(ZipEntry("$ZIP_ENTRY_ANIM_DIR/${gif.name}"))
+                        gif.inputStream().use { it.copyTo(zip) }
+                        zip.closeEntry()
+                    }
+                }
+            } ?: throw IllegalStateException("无法写入目标文件")
+            Toast.makeText(this, "压缩包导出成功", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "导出失败: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // ==================== 数据备份：导入 ====================
+
+    private fun confirmImport(title: String, action: () -> Unit) {
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage("导入将覆盖当前的全部配置（以及压缩包中的资源）。\n若导入失败，当前数据保持不变。是否继续？")
+            .setPositiveButton("继续") { _, _ -> action() }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun startImportJson() {
+        val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/json"
+        }
+        startActivityForResult(intent, REQ_IMPORT_JSON)
+    }
+
+    private fun startImportZip() {
+        val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            // 部分文件管理器对 zip 的 MIME 识别不一致，放宽为全部类型
+            type = "*/*"
+        }
+        startActivityForResult(intent, REQ_IMPORT_ZIP)
+    }
+
+    private fun importJsonFrom(uri: Uri) {
+        val configFile = ProjectConfigStore.configFile(this)
+        val oldText: String? = try {
+            if (configFile.exists()) configFile.readText() else null
+        } catch (e: Exception) {
+            null
+        }
+
+        try {
+            val text = contentResolver.openInputStream(uri)?.use {
+                it.readBytes().toString(Charsets.UTF_8)
+            } ?: throw IllegalStateException("无法读取文件")
+
+            ProjectConfigStore.parseOnly(text)
+                ?: throw IllegalArgumentException("JSON 格式错误或内容为空")
+
+            try {
+                configFile.writeText(text)
+            } catch (e: Exception) {
+                try {
+                    if (oldText != null) configFile.writeText(oldText) else configFile.delete()
+                } catch (_: Exception) {
+                    // 二次失败：至少告知用户
+                }
+                throw e
+            }
+
+            loadConfig()
+            saveConfig()
+            showPage(Page.Main)
+            Toast.makeText(this, "JSON 导入成功", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "导入失败: ${e.message}\n当前数据未改变", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun importZipFrom(uri: Uri) {
+        val tmpRoot = File(filesDir, "import_tmp")
+        val backupRoot = File(filesDir, "import_backup")
+        val configFile = ProjectConfigStore.configFile(this)
+        val animDir = ProjectConfigStore.animDir(this)
+
+        try {
+            tmpRoot.deleteRecursively()
+            backupRoot.deleteRecursively()
+            if (!tmpRoot.mkdirs()) throw IllegalStateException("无法创建临时目录")
+
+            contentResolver.openInputStream(uri)?.use { input ->
+                ZipInputStream(input).use { zip ->
+                    val canonicalRoot = tmpRoot.canonicalPath + File.separator
+                    var entry: ZipEntry? = zip.nextEntry
+                    while (entry != null) {
+                        val name = entry.name
+                        val target = File(tmpRoot, name)
+                        if (name.contains("..") ||
+                            !target.canonicalPath.startsWith(canonicalRoot)) {
+                            throw IllegalArgumentException("压缩包包含非法路径: $name")
+                        }
+                        if (entry.isDirectory) {
+                            target.mkdirs()
+                        } else {
+                            target.parentFile?.mkdirs()
+                            FileOutputStream(target).use { out -> zip.copyTo(out) }
+                        }
+                        zip.closeEntry()
+                        entry = zip.nextEntry
+                    }
+                }
+            } ?: throw IllegalStateException("无法读取压缩包")
+
+            val tmpConfig = File(tmpRoot, ZIP_ENTRY_CONFIG)
+            if (!tmpConfig.exists()) throw IllegalArgumentException("压缩包内缺少 project.json")
+            val tmpText = tmpConfig.readText()
+            val parsed = ProjectConfigStore.parseOnly(tmpText)
+                ?: throw IllegalArgumentException("project.json 格式错误")
+
+            val tmpAnimDir = File(tmpRoot, ZIP_ENTRY_ANIM_DIR)
+            val missing = mutableListOf<String>()
+            for (anim in parsed.animations.values) {
+                for (ref in anim.resources) {
+                    val f = File(tmpAnimDir, "${ref.resourceId}.gif")
+                    if (!f.exists() || f.length() == 0L) {
+                        missing.add("${ref.resourceId}.gif")
+                    }
+                }
+            }
+            if (missing.isNotEmpty()) {
+                throw IllegalArgumentException("压缩包缺少资源: ${missing.distinct().joinToString("、")}")
+            }
+
+            backupRoot.mkdirs()
+            if (configFile.exists()) {
+                configFile.copyTo(File(backupRoot, ZIP_ENTRY_CONFIG), overwrite = true)
+            }
+            val backupAnim = File(backupRoot, ZIP_ENTRY_ANIM_DIR)
+            backupAnim.mkdirs()
+            animDir.listFiles()?.forEach { old ->
+                old.copyTo(File(backupAnim, old.name), overwrite = true)
+            }
+
+            try {
+                configFile.writeText(tmpText)
+                animDir.listFiles()?.forEach { it.delete() }
+                tmpAnimDir.listFiles { f -> f.extension.lowercase() == "gif" }?.forEach { gif ->
+                    gif.copyTo(File(animDir, gif.name), overwrite = true)
+                }
+            } catch (e: Exception) {
+                try {
+                    val backupConfig = File(backupRoot, ZIP_ENTRY_CONFIG)
+                    if (backupConfig.exists()) {
+                        backupConfig.copyTo(configFile, overwrite = true)
+                    } else {
+                        configFile.delete()
+                    }
+                    animDir.listFiles()?.forEach { it.delete() }
+                    backupAnim.listFiles()?.forEach { old ->
+                        old.copyTo(File(animDir, old.name), overwrite = true)
+                    }
+                } catch (_: Exception) {
+                    Toast.makeText(
+                        this,
+                        "导入过程中断，回滚可能不完整，请检查配置",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                throw e
+            }
+
+            loadConfig()
+            saveConfig()
+            showPage(Page.Main)
+            Toast.makeText(this, "压缩包导入成功", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "导入失败: ${e.message}\n当前数据未改变", Toast.LENGTH_LONG).show()
+        } finally {
+            tmpRoot.deleteRecursively()
+            backupRoot.deleteRecursively()
+        }
+    }
+
+    // ==================== ActivityResult 分发 ====================
 
     private fun selectGif() {
         val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
@@ -345,8 +538,16 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (resultCode != RESULT_OK) return
         val uri: Uri = data?.data ?: return
-        if (requestCode == REQ_IMPORT_GIF) importGif(uri)
+        when (requestCode) {
+            REQ_IMPORT_GIF -> importGif(uri)
+            REQ_EXPORT_JSON -> exportJsonTo(uri)
+            REQ_EXPORT_ZIP -> exportZipTo(uri)
+            REQ_IMPORT_JSON -> importJsonFrom(uri)
+            REQ_IMPORT_ZIP -> importZipFrom(uri)
+        }
     }
+
+    // ==================== 资源操作 ====================
 
     private fun importGif(uri: Uri) {
         try {
@@ -411,7 +612,7 @@ class MainActivity : Activity() {
             .show()
     }
 
-    // ==================== 动画操作 ====================
+    // ==================== 动画 / 状态 / 事件规则 ====================
 
     private fun createNewAnimation() {
         var idx = 1
@@ -446,8 +647,6 @@ class MainActivity : Activity() {
             .show()
     }
 
-    // ==================== 状态操作 ====================
-
     private fun createNewState() {
         var idx = 1
         while (config.states.containsKey("state_$idx")) idx++
@@ -458,10 +657,6 @@ class MainActivity : Activity() {
         showPage(Page.StateEdit(id))
     }
 
-    /**
-     * 删除状态后统一回到状态列表。
-     * 不回到 [Page.StateGraph]，因为删除后状态图可能为空，体验不佳。
-     */
     private fun deleteState(stateId: String) {
         val state = config.states[stateId]
         val display = if (state != null) formatStateDisplay(state) else stateId
@@ -507,8 +702,6 @@ class MainActivity : Activity() {
             .show()
     }
 
-    // ==================== 事件规则操作 ====================
-
     private fun deleteEventRule(ruleId: String) {
         AlertDialog.Builder(this)
             .setTitle("删除事件规则")
@@ -522,7 +715,7 @@ class MainActivity : Activity() {
             .show()
     }
 
-    // ==================== 应用壁纸 ====================
+    // ==================== 壁纸操作 ====================
 
     private fun applyWallpaper() {
         saveConfig()
@@ -530,7 +723,6 @@ class MainActivity : Activity() {
             val intent = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
                 putExtra(
                     WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT,
-                    // apply 块内 this 是 Intent，必须显式指定 Activity 实例
                     ComponentName(this@MainActivity, GifWallpaperService::class.java)
                 )
             }
@@ -538,5 +730,37 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             Toast.makeText(this, "系统不支持动态壁纸设置", Toast.LENGTH_LONG).show()
         }
+    }
+
+    // 恢复系统默认壁纸。调用 WallpaperManager.clear() 清除当前壁纸，
+    // 系统会回退到默认壁纸。配置参数（project.json 与 GIF）保持不变。
+    // 部分国产 ROM 可能限制此调用，届时提示用户在系统设置中手动更换。
+    private fun confirmRestoreSystemWallpaper() {
+        AlertDialog.Builder(this)
+            .setTitle("恢复系统默认壁纸")
+            .setMessage(
+                "将清除动态壁纸，回到手机默认壁纸。\n" +
+                    "所有配置参数会保留。\n\n" +
+                    "注意：部分系统（如 MIUI、EMUI）可能需要在系统设置中手动更换壁纸。"
+            )
+            .setPositiveButton("恢复") { _, _ ->
+                try {
+                    val wm = WallpaperManager.getInstance(this)
+                    wm.clear()
+                    Toast.makeText(
+                        this,
+                        "已恢复系统默认壁纸",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } catch (e: Exception) {
+                    Toast.makeText(
+                        this,
+                        "恢复失败: ${e.message}\n请在系统设置中更换壁纸",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 }
