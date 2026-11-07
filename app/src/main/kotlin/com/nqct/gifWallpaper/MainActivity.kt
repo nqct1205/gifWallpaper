@@ -15,16 +15,14 @@ import android.widget.ScrollView
 import android.widget.Toast
 import java.io.File
 import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
 // 应用入口 Activity。
-// 职责：持有 ProjectConfig、页面路由、保存配置、系统级操作
-// （导入 GIF / 应用壁纸 / 恢复系统默认壁纸 / 数据备份导入导出）。
-// 部分编辑页通过 Page.StateEdit.returnTo / Page.EventRuleEdit.returnTo 记录来源页，
-// 页内返回与系统返回键均回到该来源。
-// 导入 JSON / 压缩包在写入磁盘前先做格式与资源完整性验证，失败时原数据保持不变。
 class MainActivity : Activity() {
 
     private var config = ProjectConfig()
@@ -37,13 +35,11 @@ class MainActivity : Activity() {
         object AnimationList : Page()
         data class AnimationEdit(val animationId: String) : Page()
         object StateList : Page()
-        // returnTo 默认回到状态列表；从状态图双击进入时为 StateGraph。
         data class StateEdit(
             val stateId: String,
             val returnTo: Page = StateList
         ) : Page()
         object EventRuleList : Page()
-        // ruleId 为 null 表示新建；returnTo 默认回到事件规则列表。
         data class EventRuleEdit(
             val ruleId: String?,
             val returnTo: Page = EventRuleList
@@ -57,12 +53,11 @@ class MainActivity : Activity() {
         private const val REQ_EXPORT_ZIP = 202
         private const val REQ_IMPORT_JSON = 203
         private const val REQ_IMPORT_ZIP = 204
+        private const val REQ_EXPORT_LOG = 205
 
         private const val ZIP_ENTRY_CONFIG = ProjectConfigStore.CONFIG_FILE
         private const val ZIP_ENTRY_ANIM_DIR = ProjectConfigStore.ANIM_DIR
     }
-
-    // ==================== 生命周期 ====================
 
     override fun onCreate(savedInstanceState: Bundle?) {
         requestWindowFeature(Window.FEATURE_NO_TITLE)
@@ -70,6 +65,7 @@ class MainActivity : Activity() {
         registerBackHandler()
         loadConfig()
         showPage(Page.Main)
+        LogBuffer.i("MainActivity 创建")
     }
 
     private fun registerBackHandler() {
@@ -120,8 +116,6 @@ class MainActivity : Activity() {
         }
     }
 
-    // ==================== 配置加载 / 保存 ====================
-
     private fun loadConfig() {
         when (val r = ProjectConfigStore.load(this)) {
             is ProjectConfigStore.LoadResult.Ok -> {
@@ -130,17 +124,19 @@ class MainActivity : Activity() {
             }
             is ProjectConfigStore.LoadResult.Corrupted -> {
                 lastWarning = "配置损坏，本次未应用: ${r.message}"
+                LogBuffer.e("配置损坏: ${r.message}")
             }
         }
     }
 
     private fun saveConfig(): Boolean {
         val ok = ProjectConfigStore.save(this, config)
-        if (!ok) Toast.makeText(this, "保存失败", Toast.LENGTH_SHORT).show()
+        if (!ok) {
+            Toast.makeText(this, "保存失败", Toast.LENGTH_SHORT).show()
+            LogBuffer.e("配置保存失败")
+        }
         return ok
     }
-
-    // ==================== 页面路由 ====================
 
     private fun showPage(page: Page) {
         currentPage = page
@@ -179,6 +175,7 @@ class MainActivity : Activity() {
             override fun onExportZip() { startExportZip() }
             override fun onImportJson() { confirmImport("导入 JSON") { startImportJson() } }
             override fun onImportZip() { confirmImport("导入压缩包") { startImportZip() } }
+            override fun onExportLog() { startExportLog() }
         }
     ).build()
 
@@ -316,6 +313,16 @@ class MainActivity : Activity() {
         startActivityForResult(intent, REQ_EXPORT_ZIP)
     }
 
+    private fun startExportLog() {
+        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "text/plain"
+            putExtra(Intent.EXTRA_TITLE, "gifwp_log_$ts.txt")
+        }
+        startActivityForResult(intent, REQ_EXPORT_LOG)
+    }
+
     private fun exportJsonTo(uri: Uri) {
         try {
             val src = ProjectConfigStore.configFile(this)
@@ -324,8 +331,10 @@ class MainActivity : Activity() {
                 src.inputStream().use { input -> input.copyTo(output) }
             } ?: throw IllegalStateException("无法写入目标文件")
             Toast.makeText(this, "JSON 导出成功", Toast.LENGTH_SHORT).show()
+            LogBuffer.i("JSON 导出成功")
         } catch (e: Exception) {
             Toast.makeText(this, "导出失败: ${e.message}", Toast.LENGTH_SHORT).show()
+            LogBuffer.e("JSON 导出失败", e)
         }
     }
 
@@ -350,8 +359,23 @@ class MainActivity : Activity() {
                 }
             } ?: throw IllegalStateException("无法写入目标文件")
             Toast.makeText(this, "压缩包导出成功", Toast.LENGTH_SHORT).show()
+            LogBuffer.i("压缩包导出成功")
         } catch (e: Exception) {
             Toast.makeText(this, "导出失败: ${e.message}", Toast.LENGTH_SHORT).show()
+            LogBuffer.e("压缩包导出失败", e)
+        }
+    }
+
+    private fun exportLogTo(uri: Uri) {
+        try {
+            contentResolver.openOutputStream(uri)?.use { output ->
+                val log = LogBuffer.dump()
+                output.write(log.toByteArray(Charsets.UTF_8))
+            } ?: throw IllegalStateException("无法写入目标文件")
+            Toast.makeText(this, "日志已导出", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "导出失败: ${e.message}", Toast.LENGTH_SHORT).show()
+            LogBuffer.e("日志导出失败", e)
         }
     }
 
@@ -377,7 +401,6 @@ class MainActivity : Activity() {
     private fun startImportZip() {
         val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
-            // 部分文件管理器对 zip 的 MIME 识别不一致，放宽为全部类型
             type = "*/*"
         }
         startActivityForResult(intent, REQ_IMPORT_ZIP)
@@ -387,9 +410,7 @@ class MainActivity : Activity() {
         val configFile = ProjectConfigStore.configFile(this)
         val oldText: String? = try {
             if (configFile.exists()) configFile.readText() else null
-        } catch (e: Exception) {
-            null
-        }
+        } catch (e: Exception) { null }
 
         try {
             val text = contentResolver.openInputStream(uri)?.use {
@@ -404,9 +425,7 @@ class MainActivity : Activity() {
             } catch (e: Exception) {
                 try {
                     if (oldText != null) configFile.writeText(oldText) else configFile.delete()
-                } catch (_: Exception) {
-                    // 二次失败：至少告知用户
-                }
+                } catch (_: Exception) {}
                 throw e
             }
 
@@ -414,8 +433,10 @@ class MainActivity : Activity() {
             saveConfig()
             showPage(Page.Main)
             Toast.makeText(this, "JSON 导入成功", Toast.LENGTH_SHORT).show()
+            LogBuffer.i("JSON 导入成功")
         } catch (e: Exception) {
             Toast.makeText(this, "导入失败: ${e.message}\n当前数据未改变", Toast.LENGTH_LONG).show()
+            LogBuffer.e("JSON 导入失败", e)
         }
     }
 
@@ -515,8 +536,10 @@ class MainActivity : Activity() {
             saveConfig()
             showPage(Page.Main)
             Toast.makeText(this, "压缩包导入成功", Toast.LENGTH_SHORT).show()
+            LogBuffer.i("压缩包导入成功")
         } catch (e: Exception) {
             Toast.makeText(this, "导入失败: ${e.message}\n当前数据未改变", Toast.LENGTH_LONG).show()
+            LogBuffer.e("压缩包导入失败", e)
         } finally {
             tmpRoot.deleteRecursively()
             backupRoot.deleteRecursively()
@@ -544,6 +567,7 @@ class MainActivity : Activity() {
             REQ_EXPORT_ZIP -> exportZipTo(uri)
             REQ_IMPORT_JSON -> importJsonFrom(uri)
             REQ_IMPORT_ZIP -> importZipFrom(uri)
+            REQ_EXPORT_LOG -> exportLogTo(uri)
         }
     }
 
@@ -582,8 +606,10 @@ class MainActivity : Activity() {
             saveConfig()
             showPage(Page.ResourceList)
             Toast.makeText(this, "导入成功: ${target.nameWithoutExtension}", Toast.LENGTH_SHORT).show()
+            LogBuffer.i("GIF 导入: ${target.nameWithoutExtension}")
         } catch (e: Exception) {
             Toast.makeText(this, "导入失败: ${e.message}", Toast.LENGTH_SHORT).show()
+            LogBuffer.e("GIF 导入失败", e)
         }
     }
 
@@ -607,6 +633,7 @@ class MainActivity : Activity() {
                 saveConfig()
                 showPage(Page.ResourceList)
                 Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
+                LogBuffer.i("删除资源: $resourceId")
             }
             .setNegativeButton("取消", null)
             .show()
@@ -727,14 +754,13 @@ class MainActivity : Activity() {
                 )
             }
             startActivity(intent)
+            LogBuffer.i("应用动态壁纸")
         } catch (e: Exception) {
             Toast.makeText(this, "系统不支持动态壁纸设置", Toast.LENGTH_LONG).show()
+            LogBuffer.e("应用动态壁纸失败", e)
         }
     }
 
-    // 恢复系统默认壁纸。调用 WallpaperManager.clear() 清除当前壁纸，
-    // 系统会回退到默认壁纸。配置参数（project.json 与 GIF）保持不变。
-    // 部分国产 ROM 可能限制此调用，届时提示用户在系统设置中手动更换。
     private fun confirmRestoreSystemWallpaper() {
         AlertDialog.Builder(this)
             .setTitle("恢复系统默认壁纸")
@@ -747,17 +773,15 @@ class MainActivity : Activity() {
                 try {
                     val wm = WallpaperManager.getInstance(this)
                     wm.clear()
-                    Toast.makeText(
-                        this,
-                        "已恢复系统默认壁纸",
-                        Toast.LENGTH_SHORT
-                    ).show()
+                    Toast.makeText(this, "已恢复系统默认壁纸", Toast.LENGTH_SHORT).show()
+                    LogBuffer.i("恢复系统默认壁纸")
                 } catch (e: Exception) {
                     Toast.makeText(
                         this,
                         "恢复失败: ${e.message}\n请在系统设置中更换壁纸",
                         Toast.LENGTH_LONG
                     ).show()
+                    LogBuffer.e("恢复系统默认壁纸失败", e)
                 }
             }
             .setNegativeButton("取消", null)

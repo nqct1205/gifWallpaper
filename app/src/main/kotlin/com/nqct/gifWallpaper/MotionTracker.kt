@@ -24,7 +24,7 @@ data class MotionState(
     val pitchDeg: Float = 0f,
     // 已确认的方向（防抖后的稳定结果）
     val orientation: DeviceOrientation = DeviceOrientation.UNKNOWN,
-    // 调试用文本：与 orientation.label 一致，单独保留便于渲染层直接使用
+    // 调试用文本：与 orientation.label 一致
     val postureText: String = DeviceOrientation.UNKNOWN.label,
     // 最近一次摇一摇触发时间（elapsedRealtime）；0 表示从未触发
     val lastShakeElapsedMs: Long = 0L,
@@ -41,9 +41,12 @@ data class MotionState(
 //
 // 方向防抖：连续 stableCount 次读数一致才确认方向变化，
 // 避免临界抖动导致方向频繁切换。
+//
+// 摇一摇阈值与冷却时间均可动态调整：
+//   setShakeThreshold(g)   - 灵敏度
+//   setShakeCooldown(ms)   - 冷却时长
 class MotionTracker(
     initialShakeG: Float = 2.4f,
-    private val shakeCooldownMs: Long = 1200L,
     private val lowPassAlpha: Float = 0.8f,
     private val stableCount: Int = 2
 ) {
@@ -57,7 +60,11 @@ class MotionTracker(
     var shakeThresholdG: Float = initialShakeG
         private set
 
-    // 方向变化回调（已防抖，主线程调用由外部保证）
+    // 摇一摇冷却时间（ms），可通过 setShakeCooldown 动态调整
+    @Volatile
+    private var shakeCooldownMs: Long = 1200L
+
+    // 方向变化回调（已防抖）。调用方负责切到主线程。
     var onOrientationChanged: ((DeviceOrientation) -> Unit)? = null
 
     // 方向防抖
@@ -86,6 +93,11 @@ class MotionTracker(
     // 动态调整摇一摇灵敏度。g 越小越灵敏；范围由 UI 层约束。
     fun setShakeThreshold(g: Float) {
         shakeThresholdG = g.coerceIn(1.5f, 4.0f)
+    }
+
+    // 动态调整摇一摇冷却时间。范围由 UI 层约束。
+    fun setShakeCooldown(ms: Long) {
+        shakeCooldownMs = ms.coerceIn(300L, 5000L)
     }
 
     // 统一入口：根据 sensor.type 分发。

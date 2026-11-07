@@ -8,7 +8,7 @@ import android.graphics.Typeface
 import java.util.Locale
 
 // 壁纸调试信息 / 错误信息的绘制器（无状态、无业务依赖）。
-// 显示文本（stateName / animationDisplay）由调用方传入已格式化的字符串。
+// 显示文本（stateName / animationDisplay / infoMessage）由调用方传入已格式化的字符串。
 class DebugOverlayRenderer {
 
     data class DebugState(
@@ -33,14 +33,23 @@ class DebugOverlayRenderer {
         val sensorStatus: String = "未注册",
         val isShaking: Boolean = false,
         val isTouching: Boolean = false,
-        // 计数器：用于诊断异常切换
-        val onAnimationEndCount: Int = 0,
         val enterStateCount: Int = 0,
-        val cycleTimerCount: Int = 0
+        val cycleTimerCount: Int = 0,
+        // 临时信息提示（如"正在重新加载动画"），非空时显示在面板顶部。
+        // 调用方负责在合适时间后清空（传空串）。
+        val infoMessage: String = ""
     )
 
     private val debugTextPaint = Paint().apply {
         color = Color.WHITE
+        textSize = 32f
+        textAlign = Paint.Align.CENTER
+        isAntiAlias = true
+        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+    }
+
+    private val infoTextPaint = Paint().apply {
+        color = Color.parseColor("#FFD54F")
         textSize = 32f
         textAlign = Paint.Align.CENTER
         isAntiAlias = true
@@ -60,6 +69,7 @@ class DebugOverlayRenderer {
         typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     }
 
+    // 绘制红字错误面板（画布中央偏上）。
     fun drawErrorInfo(canvas: Canvas, errorMsg: String) {
         if (errorMsg.isBlank()) return
 
@@ -92,6 +102,8 @@ class DebugOverlayRenderer {
         drawWrappedText(canvas, errorMsg, errorTextPaint, centerX, startY, maxWidth)
     }
 
+    // 绘制调试信息面板。
+    // infoMessage 非空时显示在最顶部一行（黄色高亮）。
     fun drawDebugInfo(canvas: Canvas, s: DebugState) {
         val warnSign = if (s.isAlarm) " [⚠ 超阈值]" else ""
 
@@ -108,10 +120,8 @@ class DebugOverlayRenderer {
             append("  |  当前 ").append(String.format(Locale.US, "%.2f", s.gForce)).append("g")
             append(" (阈值 ").append(String.format(Locale.US, "%.1f", s.shakeThresholdG)).append("g)")
             append("\n传感器: ").append(s.sensorStatus)
-            // 诊断计数器：正常应缓慢增长；异常切换时 enterStateCount 会快速飙升
             append("\n计数: enter=").append(s.enterStateCount)
                 .append("  timer=").append(s.cycleTimerCount)
-                .append("  animEnd=").append(s.onAnimationEndCount)
         }
 
         val memoryText = String.format(
@@ -128,9 +138,19 @@ class DebugOverlayRenderer {
         val centerX = canvas.width / 2f
         val centerY = if (s.hasError) canvas.height / 2f * 1.4f else canvas.height / 2f
 
-        val lines = memoryText.split("\n")
+        // 计算整体高度（含 infoMessage 行）
         var totalHeight = 0f
-        for (line in lines) {
+        val infoLines = if (s.infoMessage.isNotEmpty()) s.infoMessage.split("\n") else emptyList()
+        for (line in infoLines) {
+            var start = 0
+            while (start < line.length) {
+                val count = infoTextPaint.breakText(line, start, line.length, true, maxWidth, null)
+                totalHeight += infoTextPaint.textSize * 1.2f
+                start += count.coerceAtLeast(1)
+            }
+            if (line.isEmpty()) totalHeight += infoTextPaint.textSize * 1.2f
+        }
+        for (line in memoryText.split("\n")) {
             var start = 0
             while (start < line.length) {
                 val count = debugTextPaint.breakText(line, start, line.length, true, maxWidth, null)
@@ -153,8 +173,11 @@ class DebugOverlayRenderer {
         canvas.drawRoundRect(rect, 20f, 20f, debugBgPaint)
         debugBgPaint.color = oldColor
 
-        val startY = centerY - totalHeight / 2 + debugTextPaint.textSize
-        drawWrappedText(canvas, memoryText, debugTextPaint, centerX, startY, maxWidth)
+        var currentY = centerY - totalHeight / 2 + infoTextPaint.textSize
+        if (infoLines.isNotEmpty()) {
+            currentY = drawWrappedText(canvas, s.infoMessage, infoTextPaint, centerX, currentY, maxWidth)
+        }
+        drawWrappedText(canvas, memoryText, debugTextPaint, centerX, currentY, maxWidth)
     }
 
     private fun drawWrappedText(

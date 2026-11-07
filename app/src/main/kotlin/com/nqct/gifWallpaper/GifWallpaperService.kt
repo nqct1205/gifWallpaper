@@ -6,11 +6,7 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.ImageDecoder
 import android.graphics.RectF
-import android.graphics.drawable.AnimatedImageDrawable
-import android.graphics.drawable.Animatable2
-import android.graphics.drawable.Drawable
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -25,35 +21,24 @@ import android.view.MotionEvent
 import android.view.SurfaceHolder
 import java.io.File
 
-// GIF 状态机动态壁纸服务。
+// GIF 状态机动态壁纸服务（android-gif-drawable 自播 + 定时器驱动状态切换）。
 //
-// 【核心设计（本轮重大变更）】
-// 状态切换由**定时器**驱动，不再依赖 AnimatedImageDrawable.onAnimationEnd。
+// 【架构】
+//   - 每个动画一个 AnimRuntime，含每个资源引用一个独立的 GifDrawable 实例。
+//   - GifDrawable 由 start() 自己推进帧，不做每帧 seek（避免卡顿）。
+//   - 状态切换由定时器驱动（时长 = GifDrawable.duration 一圈）。
+//   - 切换时：旧 AnimRuntime.stop() → 新 AnimRuntime.reset()（seekToFrame(0)）→ start()
+//     这一次 seek 就根治了"闪最后一帧"。
 //
-// 原因：AnimatedImageDrawable 在 repeatCount = 0（播一遍）播完后，
-// start() 的重启行为在多实例场景下不可靠（实测播完后再 start() 不会重启，
-// 多次 enterState 反复 stop/start 后甚至永远停第一帧）。
-// onAnimationEnd 的回调也在这类状态下存在时序不可控问题。
+// 【内存策略】全量预加载 + trim 时释放非当前。
+//   系统内存告急（TRIM_MEMORY_MODERATE 及以上）时释放当前状态未引用的动画实例。
+//   之后状态机切到被释放的动画时，enterState 检测到 cache miss，自动异步重载：
+//     - 重载期间 currentRuntime = null，调试面板显示"正在重新加载"提示（约 5 秒）
+//     - 重载完成后加入 cache，若当前状态仍是原 stateId 则立即激活
+//     - 重载失败时显示"重新加载失败"提示（约 8 秒），并写错误日志
+//   这是有意的取舍：多数时候内存充足不会触发 trim；触发时通过重载保证功能正确。
 //
-// 新方案：
-//   - 动画一律 repeatCount = REPEAT_INFINITE，动画本身永远循环播放，视觉不卡。
-//   - 状态切换用 handler.postDelayed 定时器：时长 = GifInfo.totalDelayMs（一轮）。
-//   - 定时器每轮触发 playback.onCycleComplete()：未达目标圈数则原地继续
-//     （动画一直在播，不需要重启，仅重启定时器）；达到则切换状态。
-//   - onAnimationEnd 仅保留用于调试计数（onAnimationEndCount），不驱动任何逻辑。
-//
-// 【全局开关】来自 SharedPreferences "PetPrefs"：
-//   enableOrientation / enableShake / enableClick：是否启用对应主事件
-//   shakeSensitivity：摇一摇阈值（g）
-//   showDebug / limitDraw / limitMem：调试
-//
-// 【传感器注册策略】
-//   GRAVITY: enableOrientation || enableShake || userShowDebug
-//   ACCEL:   enableShake || userShowDebug
-//   开关只拦截触发行为，不影响注册（条件判定可能仍需要方向）。
-//   不可见时统一注销。
-//
-// 【多实例】同一动画内每个资源引用一个独立 AnimatedImageDrawable。
+// 【日志】关键事件写入 LogBuffer，可在 App 主页导出。
 class GifWallpaperService : WallpaperService() {
 
     @Volatile private var currentEngine: GifEngine? = null
@@ -65,11 +50,12 @@ class GifWallpaperService : WallpaperService() {
         currentEngine?.handleTrimMemory(level)
     }
 
-    private data class RenderInstance(
-        val ref: AnimationResourceRef,
-        val drawable: AnimatedImageDrawable,
-        val info: GifInfo?
-    )
+    private companion object {
+        // TRIM_MEMORY_MODERATE 自 API 34 起 deprecated（官方理由：具体数值/含义可能变化），
+        // 但系统仍会回调此级别。集中一处 @Suppress，方便未来复查。
+        @Suppress("DEPRECATION")
+        val TRIM_LEVEL_RELEASE: Int = ComponentCallbacks2.TRIM_MEMORY_MODERATE
+    }
 
     inner class GifEngine : Engine(), SharedPreferences.OnSharedPreferenceChangeListener,
         SensorEventListener {
@@ -84,14 +70,21 @@ class GifWallpaperService : WallpaperService() {
         private var config: ProjectConfig = ProjectConfig()
         private val playback = PlaybackController { config }
 
-        private val animRuntimeCache = mutableMapOf<String, List<RenderInstance>>()
-        private var currentRuntime: List<RenderInstance> = emptyList()
+        // 每个动画 ID -> AnimRuntime
+        private val animRuntimeCache = mutableMapOf<String, AnimRuntime>()
+        // 当前状态的动画运行时
+        private var currentRuntime: AnimRuntime? = null
         private var currentRenderStateId: String = ""
+
+        // 重载状态（用于 trim 释放后自动重载）
+        private var pendingReloadAnimId: String? = null
+        private var pendingReloadStateId: String? = null
+        private var pendingReloadGen = 0
 
         private var loaderThread: Thread? = null
         private var prefs: SharedPreferences? = null
 
-        // ==================== 周期定时器（核心） ====================
+        // ==================== 周期定时器 ====================
         private var cycleTimerRunnable: Runnable? = null
 
         // ==================== 全局开关 ====================
@@ -124,11 +117,14 @@ class GifWallpaperService : WallpaperService() {
         private var frameIntervalMs = 0L
         private var drawTimeMs = 0f
         private var lastMemoryUpdateTime = 0L
+        private var lastStatusLogTime = 0L
         private var currentMemMb = 0
         private var loadErrorMsg = ""
 
-        // 调试计数器：用于诊断
-        @Volatile private var onAnimationEndCount = 0
+        // 临时信息提示：在调试面板顶部显示一段时间的文本
+        private var infoMsg: String = ""
+        private var infoMsgUntil: Long = 0L
+
         @Volatile private var enterStateCount = 0
         @Volatile private var cycleTimerCount = 0
 
@@ -140,12 +136,7 @@ class GifWallpaperService : WallpaperService() {
         private var needsResetOnVisible = false
         private val LOW_MEM_AVAIL_MB = 150L
 
-        // ==================== 动画回调（仅调试计数，不驱动逻辑） ====================
-        private val animCallback = object : Animatable2.AnimationCallback() {
-            override fun onAnimationEnd(drawable: Drawable?) {
-                onAnimationEndCount++
-            }
-        }
+        // ==================== 渲染循环 ====================
 
         private val drawRunnable = object : Runnable {
             override fun run() {
@@ -171,14 +162,17 @@ class GifWallpaperService : WallpaperService() {
             motionTracker.onOrientationChanged = { newOrientation ->
                 handler.post { handleOrientationChanged(newOrientation) }
             }
+
+            LogBuffer.i("Engine 创建 (gravity=${gravitySensor != null}, accel=${accelSensor != null})")
         }
 
         override fun onDestroy() {
             super.onDestroy()
+            LogBuffer.i("Engine 销毁")
             prefs?.unregisterOnSharedPreferenceChangeListener(this)
             unregisterSensors()
             cancelCycleTimer()
-            cleanupAnimCallbacks()
+            releaseAllRuntimes()
         }
 
         private fun readGlobalPrefs() {
@@ -189,8 +183,8 @@ class GifWallpaperService : WallpaperService() {
             enableOrientation = p.getBoolean("enableOrientation", true)
             enableShake = p.getBoolean("enableShake", true)
             enableClick = p.getBoolean("enableClick", true)
-            val sensitivity = p.getFloat("shakeSensitivity", 2.4f)
-            motionTracker.setShakeThreshold(sensitivity)
+            motionTracker.setShakeThreshold(p.getFloat("shakeSensitivity", 2.4f))
+            motionTracker.setShakeCooldown(p.getLong("shakeCooldownMs", 1200L))
         }
 
         override fun onSharedPreferenceChanged(sharedPreferences: SharedPreferences?, key: String?) {
@@ -207,28 +201,22 @@ class GifWallpaperService : WallpaperService() {
                         }
                     }
                 }
-                "enableOrientation" -> {
-                    handler.post {
-                        enableOrientation = sharedPreferences.getBoolean("enableOrientation", true)
-                        if (!sensorsRegistered && visible) registerSensorsIfNeeded()
-                    }
+                "enableOrientation" -> handler.post {
+                    enableOrientation = sharedPreferences.getBoolean("enableOrientation", true)
+                    if (!sensorsRegistered && visible) registerSensorsIfNeeded()
                 }
-                "enableShake" -> {
-                    handler.post {
-                        enableShake = sharedPreferences.getBoolean("enableShake", true)
-                        if (!sensorsRegistered && visible) registerSensorsIfNeeded()
-                    }
+                "enableShake" -> handler.post {
+                    enableShake = sharedPreferences.getBoolean("enableShake", true)
+                    if (!sensorsRegistered && visible) registerSensorsIfNeeded()
                 }
-                "enableClick" -> {
-                    handler.post {
-                        enableClick = sharedPreferences.getBoolean("enableClick", true)
-                    }
+                "enableClick" -> handler.post {
+                    enableClick = sharedPreferences.getBoolean("enableClick", true)
                 }
-                "shakeSensitivity" -> {
-                    handler.post {
-                        val v = sharedPreferences.getFloat("shakeSensitivity", 2.4f)
-                        motionTracker.setShakeThreshold(v)
-                    }
+                "shakeSensitivity" -> handler.post {
+                    motionTracker.setShakeThreshold(sharedPreferences.getFloat("shakeSensitivity", 2.4f))
+                }
+                "shakeCooldownMs" -> handler.post {
+                    motionTracker.setShakeCooldown(sharedPreferences.getLong("shakeCooldownMs", 1200L))
                 }
             }
         }
@@ -243,8 +231,9 @@ class GifWallpaperService : WallpaperService() {
 
         fun handleTrimMemory(level: Int) {
             if (destroyed) return
-            if (level >= ComponentCallbacks2.TRIM_MEMORY_MODERATE) {
-                releaseNonCurrentCaches()
+            if (level >= TRIM_LEVEL_RELEASE) {
+                LogBuffer.w("onTrimMemory($level)：释放非当前动画实例")
+                releaseNonCurrentRuntimes()
             }
         }
 
@@ -255,17 +244,19 @@ class GifWallpaperService : WallpaperService() {
             loaderThread?.interrupt()
             loaderThread = Thread {
                 try {
+                    LogBuffer.i("开始加载配置")
                     var cfg = ProjectConfig()
                     var cfgMsg: String? = null
                     when (val r = ProjectConfigStore.load(this@GifWallpaperService)) {
                         is ProjectConfigStore.LoadResult.Ok -> cfg = r.config
                         is ProjectConfigStore.LoadResult.Corrupted -> {
                             cfgMsg = "配置损坏: ${r.message}\n(未应用，等待用户处理)"
+                            LogBuffer.e("配置损坏: ${r.message}")
                         }
                     }
 
                     val dir = ProjectConfigStore.animDir(this@GifWallpaperService)
-                    val newCache = mutableMapOf<String, List<RenderInstance>>()
+                    val newCache = mutableMapOf<String, AnimRuntime>()
                     val sb = StringBuilder()
                     if (cfgMsg != null) sb.append(cfgMsg).append("\n")
                     if (cfg.states.isEmpty()) sb.append("状态为空\n")
@@ -273,55 +264,55 @@ class GifWallpaperService : WallpaperService() {
                     for ((animId, anim) in cfg.animations) {
                         if (gen != loadGeneration) return@Thread
                         if (Thread.currentThread().isInterrupted) return@Thread
-                        val instances = mutableListOf<RenderInstance>()
+                        val instances = mutableListOf<AnimResourceInstance>()
                         for (ref in anim.resources) {
                             val resource = cfg.resources[ref.resourceId] ?: continue
                             val file = File(dir, resource.fileName)
-                            val drawable = decodeAnimatedDrawable(file) ?: run {
-                                sb.append("解码失败: ${resource.id}\n"); null
-                            } ?: continue
-                            // 无限循环：动画永久播，不依赖 repeatCount=0 的重启
-                            drawable.repeatCount = AnimatedImageDrawable.REPEAT_INFINITE
-                            instances.add(RenderInstance(ref, drawable, resource.info))
+                            val inst = AnimResourceInstance.fromFile(resource.id, ref, file)
+                            if (inst.gifDrawable == null) {
+                                sb.append("解码失败: ${resource.id}\n")
+                                LogBuffer.e("解码失败: ${resource.id}")
+                            }
+                            instances.add(inst)
                         }
-                        if (instances.isNotEmpty()) newCache[animId] = instances
+                        if (instances.isNotEmpty()) {
+                            val runtime = AnimRuntime(animId, instances)
+                            newCache[animId] = runtime
+                            LogBuffer.i(
+                                "动画 $animId 预加载 ${instances.size} 个实例，"
+                                    + "内存约 ${runtime.allocationBytes / 1024 / 1024}MB"
+                            )
+                        }
                     }
 
                     if (gen != loadGeneration) return@Thread
 
                     handler.post {
                         if (destroyed || gen != loadGeneration) return@post
-                        cleanupAnimCallbacks()
-                        animRuntimeCache.clear()
-
-                        // 仅主实例注册回调（用于调试计数）
-                        for ((_, instances) in newCache) {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                                try {
-                                    instances.firstOrNull()?.drawable?.registerAnimationCallback(animCallback)
-                                } catch (_: Exception) {}
-                            }
-                        }
+                        releaseAllRuntimes()
+                        animRuntimeCache.putAll(newCache)
 
                         config = cfg
-                        animRuntimeCache.putAll(newCache)
                         loadErrorMsg = sb.toString()
                         readGlobalPrefs()
                         forceShowDebug = false
                         engineStartTime = SystemClock.elapsedRealtime()
 
                         playback.reset()
-                        enterState(playback.currentStateId())
+                        enterState(playback.currentStateId(), "加载完成")
 
                         ready = true
                         registerSensorsIfNeeded()
                         if (visible) {
                             handler.removeCallbacks(drawRunnable)
+                            lastFrameTime = 0L
                             handler.post(drawRunnable)
                         }
+                        LogBuffer.i("加载完成: ${cfg.states.size} 状态, ${cfg.animations.size} 动画")
                     }
                 } catch (e: Exception) {
                     if (gen != loadGeneration) return@Thread
+                    LogBuffer.e("加载异常", e)
                     e.printStackTrace()
                     handler.post {
                         if (destroyed || gen != loadGeneration) return@post
@@ -329,6 +320,7 @@ class GifWallpaperService : WallpaperService() {
                         ready = true
                         if (visible) {
                             handler.removeCallbacks(drawRunnable)
+                            lastFrameTime = 0L
                             handler.post(drawRunnable)
                         }
                     }
@@ -336,97 +328,166 @@ class GifWallpaperService : WallpaperService() {
             }.also { it.start() }
         }
 
-        private fun cleanupAnimCallbacks() {
-            for (instances in animRuntimeCache.values) {
-                for (inst in instances) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                        try { inst.drawable.unregisterAnimationCallback(animCallback) } catch (_: Exception) {}
-                    }
-                    try { inst.drawable.stop() } catch (_: Exception) {}
-                }
+        private fun releaseAllRuntimes() {
+            var totalBytes = 0L
+            for (rt in animRuntimeCache.values) {
+                totalBytes += rt.allocationBytes
+                rt.recycle()
+            }
+            animRuntimeCache.clear()
+            currentRuntime = null
+            pendingReloadAnimId = null
+            pendingReloadStateId = null
+            if (totalBytes > 0) {
+                LogBuffer.i("释放全部运行时实例: ${totalBytes / 1024 / 1024}MB")
             }
         }
 
-        // ==================== 解码 ====================
-
-        private fun decodeAnimatedDrawable(file: File): AnimatedImageDrawable? {
-            if (!file.exists() || Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return null
-            return try {
-                val dm = resources.displayMetrics
-                val maxDim = maxOf(dm.widthPixels, dm.heightPixels).coerceAtLeast(1)
-                val source = ImageDecoder.createSource(file)
-                val listener = object : ImageDecoder.OnHeaderDecodedListener {
-                    override fun onHeaderDecoded(
-                        decoder: ImageDecoder, info: ImageDecoder.ImageInfo, src: ImageDecoder.Source
-                    ) {
-                        val w = info.size.width
-                        val h = info.size.height
-                        val longSide = maxOf(w, h)
-                        if (longSide > maxDim && longSide > 0) {
-                            val s = maxDim.toFloat() / longSide
-                            decoder.setTargetSize(
-                                (w * s).toInt().coerceAtLeast(1),
-                                (h * s).toInt().coerceAtLeast(1)
-                            )
-                        }
-                    }
-                }
-                ImageDecoder.decodeDrawable(source, listener) as? AnimatedImageDrawable
-            } catch (e: Exception) {
-                null
+        // 释放当前状态未引用的动画实例。
+        // 若某个动画正在异步重载（pendingReloadAnimId），跳过。
+        private fun releaseNonCurrentRuntimes() {
+            val keepAnimId = config.states[currentRenderStateId]?.animationId ?: ""
+            val pending = pendingReloadAnimId
+            val toRemove = animRuntimeCache.keys.filter { it != keepAnimId && it != pending }
+            for (id in toRemove) {
+                animRuntimeCache.remove(id)?.recycle()
+            }
+            if (toRemove.isNotEmpty()) {
+                LogBuffer.w("释放 ${toRemove.size} 个非当前动画实例")
             }
         }
 
-        // ==================== 状态切换（核心） ====================
+        // ==================== 状态切换 ====================
 
-        private fun enterState(stateId: String) {
+        private fun enterState(stateId: String, reason: String) {
             enterStateCount++
             cancelCycleTimer()
+            currentRuntime?.stop()
+
+            val prevId = currentRenderStateId
             currentRenderStateId = stateId
-            val state = config.states[stateId]
-            val animId = state?.animationId ?: ""
-            currentRuntime = animRuntimeCache[animId] ?: emptyList()
-            loadErrorMsg = if (currentRuntime.isEmpty()) {
-                "无可用动画实例: state=$stateId"
+            val animId = config.states[stateId]?.animationId ?: ""
+
+            // 检查缓存：若动画已被 trim 释放，异步重载
+            val cached = if (animId.isNotEmpty()) animRuntimeCache[animId] else null
+            if (animId.isNotEmpty() && cached == null) {
+                currentRuntime = null
+                loadErrorMsg = ""
+                startReloadAnimation(animId, stateId)
+                if (prevId != stateId) {
+                    LogBuffer.i("状态切换: ${prevId.ifEmpty { "(初始)" }} -> $stateId ($reason)，动画缺失需重载")
+                }
+                return
+            }
+
+            currentRuntime = cached
+            loadErrorMsg = if (cached == null || cached.instances.isEmpty()) {
+                "无可用动画: state=$stateId"
             } else ""
 
-            // stop + setVisible 让 drawable 从第一帧开始（即使之前播过）
-            for (inst in currentRuntime) {
-                try { inst.drawable.stop() } catch (_: Exception) {}
-                try { inst.drawable.setVisible(true, true) } catch (_: Exception) {}
-            }
-            if (visible) {
-                for (inst in currentRuntime) {
-                    try { inst.drawable.start() } catch (_: Exception) {}
-                }
-            }
+            currentRuntime?.reset()
+            if (visible) currentRuntime?.start()
 
-            scheduleNextCycle()
+            lastFrameTime = 0L
+            scheduleCycleTimer()
+
+            if (prevId != stateId) {
+                LogBuffer.i("状态切换: ${prevId.ifEmpty { "(初始)" }} -> $stateId ($reason)")
+            }
         }
 
-        // 计划下一轮定时器。时长 = GifInfo.totalDelayMs（一轮）。
-        // 到时时调用 onCycleComplete：
-        //   - 未达目标圈数：只重启定时器（动画一直在播，不用重启）
-        //   - 达到目标：切换状态（enterState 会取消旧定时器并启动新的）
-        private fun scheduleNextCycle() {
+        // 异步重载指定动画。完成后若当前状态仍为 stateId，则激活。
+        //
+        // 重载期间：
+        //   - currentRuntime 保持 null，调试面板显示"正在重新加载"提示
+        //   - 不安排周期定时器（避免空 runtime 触发状态机切换）
+        //
+        // 重载完成后：
+        //   - 动画加入 animRuntimeCache
+        //   - 若 currentRenderStateId == stateId：激活（reset + start + scheduleCycleTimer）
+        //   - 否则只放缓存，等状态机自然切回
+        private fun startReloadAnimation(animId: String, stateId: String) {
+            if (pendingReloadAnimId == animId) {
+                LogBuffer.d("已有相同动画在重载中: $animId")
+                return
+            }
+            pendingReloadAnimId = animId
+            pendingReloadStateId = stateId
+            val gen = ++pendingReloadGen
+
+            setInfoMessage("⟳ 正在重新加载动画: $animId", 5000L)
+            LogBuffer.w("动画被系统释放，开始异步重载: $animId")
+
+            Thread {
+                val anim = config.animations[animId]
+                val instances = mutableListOf<AnimResourceInstance>()
+                if (anim != null) {
+                    val dir = ProjectConfigStore.animDir(this@GifWallpaperService)
+                    for (ref in anim.resources) {
+                        val resource = config.resources[ref.resourceId] ?: continue
+                        val file = File(dir, resource.fileName)
+                        val inst = AnimResourceInstance.fromFile(resource.id, ref, file)
+                        instances.add(inst)
+                    }
+                }
+                handler.post {
+                    if (destroyed || gen != pendingReloadGen) return@post
+                    pendingReloadAnimId = null
+                    pendingReloadStateId = null
+
+                    val ok = instances.isNotEmpty() && instances.any { it.gifDrawable != null }
+                    if (!ok) {
+                        setInfoMessage("✗ 重新加载失败: $animId", 8000L)
+                        LogBuffer.e("动画重新加载失败: $animId")
+                        return@post
+                    }
+
+                    val runtime = AnimRuntime(animId, instances)
+                    animRuntimeCache[animId] = runtime
+                    LogBuffer.i("动画重新加载完成: $animId (${runtime.allocationBytes / 1024 / 1024}MB)")
+
+                    // 如果当前状态还是原 stateId，激活
+                    if (currentRenderStateId == stateId) {
+                        currentRuntime = runtime
+                        loadErrorMsg = ""
+                        setInfoMessage("✓ 已重新加载: $animId", 5000L)
+                        runtime.reset()
+                        if (visible) runtime.start()
+                        lastFrameTime = 0L
+                        scheduleCycleTimer()
+                    } else {
+                        // 用户已切走，只更新提示
+                        setInfoMessage("✓ 已重新加载: $animId（当前已切走）", 3000L)
+                    }
+                }
+            }.start()
+        }
+
+        private fun setInfoMessage(msg: String, durationMs: Long) {
+            infoMsg = msg
+            infoMsgUntil = SystemClock.elapsedRealtime() + durationMs
+        }
+
+        private fun scheduleCycleTimer() {
             cancelCycleTimer()
             if (!visible || destroyed) return
-            val totalDelay = currentRuntime.firstOrNull()?.info?.totalDelayMs ?: 0
-            if (totalDelay <= 0) return
+            val duration = currentRuntime?.totalDurationMs ?: 0L
+            if (duration <= 0) return
 
             val runnable = Runnable {
                 cycleTimerCount++
                 if (destroyed || !visible) return@Runnable
                 val nextId = playback.onCycleComplete()
                 if (nextId != currentRenderStateId) {
-                    enterState(nextId)
+                    enterState(nextId, "周期完成")
                 } else {
-                    // 原地重播：动画没变，只重启定时器
-                    scheduleNextCycle()
+                    currentRuntime?.reset()
+                    currentRuntime?.start()
+                    scheduleCycleTimer()
                 }
             }
             cycleTimerRunnable = runnable
-            handler.postDelayed(runnable, totalDelay.toLong())
+            handler.postDelayed(runnable, duration)
         }
 
         private fun cancelCycleTimer() {
@@ -434,70 +495,23 @@ class GifWallpaperService : WallpaperService() {
             cycleTimerRunnable = null
         }
 
-        // ==================== 释放 ====================
-
-        private fun isMemoryCramped(): Boolean {
-            return try {
-                val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-                val mi = ActivityManager.MemoryInfo()
-                am.getMemoryInfo(mi)
-                mi.lowMemory || mi.availMem < LOW_MEM_AVAIL_MB * 1024L * 1024L
-            } catch (e: Exception) {
-                false
-            }
-        }
-
-        private fun releaseAnimRuntime(animId: String) {
-            animRuntimeCache.remove(animId)?.forEach { inst ->
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    try { inst.drawable.unregisterAnimationCallback(animCallback) } catch (_: Exception) {}
-                }
-                try { inst.drawable.stop() } catch (_: Exception) {}
-            }
-        }
-
-        private fun releaseNonCurrentCaches() {
-            val keepAnimId = config.states[currentRenderStateId]?.animationId ?: ""
-            val toRemove = animRuntimeCache.keys.filter { it != keepAnimId }.toList()
-            for (id in toRemove) releaseAnimRuntime(id)
-        }
-
-        private fun maybeReleaseOnInvisible() {
-            if (!isMemoryCramped()) return
-            val defaultAnimId = config.states[config.defaultStateId]?.animationId ?: ""
-            if (defaultAnimId.isEmpty()) return
-            val toRemove = animRuntimeCache.keys.filter { it != defaultAnimId }.toList()
-            if (toRemove.isEmpty()) return
-            for (id in toRemove) releaseAnimRuntime(id)
-            if (config.states[currentRenderStateId]?.animationId != defaultAnimId) {
-                currentRuntime = emptyList()
-                needsResetOnVisible = true
-            }
-        }
-
-        // ==================== 传感器注册 ====================
+        // ==================== 传感器 ====================
 
         private fun registerSensorsIfNeeded() {
             if (sensorsRegistered || destroyed) return
-
             val needGravity = enableOrientation || enableShake || userShowDebug
             val needAccel = enableShake || userShowDebug
-
             if (!needGravity && !needAccel) return
-
             if (needGravity && gravitySensor != null) {
-                sensorManager.registerListener(
-                    this, gravitySensor, SensorManager.SENSOR_DELAY_NORMAL
-                )
+                sensorManager.registerListener(this, gravitySensor, SensorManager.SENSOR_DELAY_NORMAL)
                 gravityRegistered = true
             }
             if (needAccel && accelSensor != null) {
-                sensorManager.registerListener(
-                    this, accelSensor, SensorManager.SENSOR_DELAY_UI
-                )
+                sensorManager.registerListener(this, accelSensor, SensorManager.SENSOR_DELAY_UI)
                 accelRegistered = true
             }
             sensorsRegistered = gravityRegistered || accelRegistered
+            LogBuffer.i("传感器注册: gravity=$gravityRegistered, accel=$accelRegistered")
         }
 
         private fun unregisterSensors() {
@@ -506,13 +520,13 @@ class GifWallpaperService : WallpaperService() {
                 sensorsRegistered = false
                 gravityRegistered = false
                 accelRegistered = false
+                LogBuffer.i("传感器注销")
             }
         }
 
         override fun onSensorChanged(event: SensorEvent) {
             motionTracker.onSensorChanged(event)
             if (!visible || destroyed) return
-
             if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
                 val s = motionTracker.state
                 if (s.lastShakeElapsedMs > lastHandledShakeElapsed) {
@@ -520,8 +534,9 @@ class GifWallpaperService : WallpaperService() {
                     if (!enableShake) return
                     val hasShakeRule = config.eventRules.any { it.type == EventType.SHAKE }
                     if (!hasShakeRule) return
+                    LogBuffer.i("摇一摇触发 (g=${"%.2f".format(s.gForce)}, 方向=${s.postureText})")
                     if (playback.handleEvent(EventType.SHAKE, "", s.orientation)) {
-                        enterState(playback.currentStateId())
+                        enterState(playback.currentStateId(), "摇一摇")
                     }
                 }
             }
@@ -535,8 +550,9 @@ class GifWallpaperService : WallpaperService() {
             if (!enableOrientation) return
             val hasOrientationRule = config.eventRules.any { it.type == EventType.ORIENTATION }
             if (!hasOrientationRule) return
+            LogBuffer.i("方向变化: ${newOrientation.label}")
             if (playback.handleEvent(EventType.ORIENTATION, newOrientation.name, newOrientation)) {
-                enterState(playback.currentStateId())
+                enterState(playback.currentStateId(), "方向=${newOrientation.label}")
             }
         }
 
@@ -551,8 +567,9 @@ class GifWallpaperService : WallpaperService() {
                     if (!enableClick) return
                     val hasClickRule = config.eventRules.any { it.type == EventType.CLICK }
                     if (!hasClickRule) return
+                    LogBuffer.i("点击触发 (${s.x.toInt()}, ${s.y.toInt()})")
                     if (playback.handleEvent(EventType.CLICK, "", motionTracker.state.orientation)) {
-                        enterState(playback.currentStateId())
+                        enterState(playback.currentStateId(), "点击")
                     }
                 }
             }
@@ -562,31 +579,27 @@ class GifWallpaperService : WallpaperService() {
 
         override fun onVisibilityChanged(visible: Boolean) {
             this.visible = visible
+            LogBuffer.i("可见性: $visible")
             if (visible) {
                 registerSensorsIfNeeded()
                 if (needsResetOnVisible) {
                     needsResetOnVisible = false
                     playback.reset()
-                    enterState(playback.currentStateId())
+                    enterState(playback.currentStateId(), "恢复可见")
                 } else {
-                    for (inst in currentRuntime) {
-                        try { inst.drawable.start() } catch (_: Exception) {}
-                    }
-                    // 恢复定时器（进入不可见时被取消）
-                    scheduleNextCycle()
+                    currentRuntime?.start()
+                    scheduleCycleTimer()
                 }
+                lastFrameTime = 0L
                 if (ready) {
                     handler.removeCallbacks(drawRunnable)
                     handler.post(drawRunnable)
                 }
             } else {
-                for (inst in currentRuntime) {
-                    try { inst.drawable.stop() } catch (_: Exception) {}
-                }
                 handler.removeCallbacks(drawRunnable)
                 cancelCycleTimer()
+                currentRuntime?.stop()
                 unregisterSensors()
-                maybeReleaseOnInvisible()
             }
         }
 
@@ -597,6 +610,7 @@ class GifWallpaperService : WallpaperService() {
 
         override fun onSurfaceDestroyed(holder: SurfaceHolder) {
             super.onSurfaceDestroyed(holder)
+            LogBuffer.i("Surface 销毁")
             destroyed = true
             visible = false
             ready = false
@@ -605,9 +619,7 @@ class GifWallpaperService : WallpaperService() {
             loaderThread?.interrupt()
             loaderThread = null
             unregisterSensors()
-            cleanupAnimCallbacks()
-            animRuntimeCache.clear()
-            currentRuntime = emptyList()
+            releaseAllRuntimes()
         }
 
         // ==================== 渲染 ====================
@@ -616,7 +628,8 @@ class GifWallpaperService : WallpaperService() {
             val holder = surfaceHolder
             val now = SystemClock.elapsedRealtime()
 
-            if (lastFrameTime > 0) frameIntervalMs = now - lastFrameTime
+            val deltaMs = if (lastFrameTime > 0) now - lastFrameTime else 0L
+            frameIntervalMs = deltaMs
             lastFrameTime = now
 
             if (now - lastMemoryUpdateTime > 1000) {
@@ -627,6 +640,16 @@ class GifWallpaperService : WallpaperService() {
                     forceShowDebug = true
                 }
                 lastMemoryUpdateTime = now
+            }
+
+            if (now - lastStatusLogTime > 5000) {
+                lastStatusLogTime = now
+                val rt = currentRuntime
+                LogBuffer.i(
+                    "运行: state=$currentRenderStateId, 帧耗时=${"%.1f".format(drawTimeMs)}ms, "
+                        + "内存=${currentMemMb}MB, 实例内存=${(rt?.allocationBytes ?: 0L) / 1024 / 1024}MB, "
+                        + "帧间隔=${frameIntervalMs}ms"
+                )
             }
 
             var canvas: Canvas? = null
@@ -640,21 +663,23 @@ class GifWallpaperService : WallpaperService() {
                 if (canvas == null) return 33L
                 canvas.drawColor(resolveCurrentBackgroundColor())
 
-                if (currentRuntime.isNotEmpty()) {
+                val rt = currentRuntime
+                if (rt != null && rt.instances.isNotEmpty()) {
                     val screenW = canvas.width
                     val screenH = canvas.height
-                    for (inst in currentRuntime) {
+                    for (inst in rt.instances) {
                         val info = inst.info ?: continue
                         val bounds = computeBounds(inst.ref, info, screenW, screenH)
-                        inst.drawable.setBounds(
+                        inst.setBounds(
                             bounds.left.toInt(), bounds.top.toInt(),
                             bounds.right.toInt(), bounds.bottom.toInt()
                         )
-                        inst.drawable.draw(canvas)
+                        inst.draw(canvas)
                     }
                     animDrawEndTime = System.nanoTime()
 
                     val needShowDebug = userShowDebug || forceShowDebug || loadErrorMsg.isNotEmpty()
+                        || (now < infoMsgUntil)
                     if (needShowDebug) {
                         val alarm = forceShowDebug || loadErrorMsg.isNotEmpty()
                         debugRenderer.drawDebugInfo(canvas, buildDebugState(now, alarm))
@@ -665,14 +690,9 @@ class GifWallpaperService : WallpaperService() {
                     animDrawEndTime = System.nanoTime()
                 }
 
-                val primaryInfo = currentRuntime.firstOrNull()?.info
-                return if (primaryInfo != null && primaryInfo.frameCount > 0 && primaryInfo.totalDelayMs > 0) {
-                    val elapsed = ((now - playback.stateEnterTimeMs()) % primaryInfo.totalDelayMs).toInt()
-                    primaryInfo.nextFrameDelayMs(elapsed, primaryInfo.totalDelayMs)
-                } else {
-                    primaryInfo?.frameIntervalMs(0) ?: 33L
-                }
+                return computeNextFrameDelay()
             } catch (e: Exception) {
+                LogBuffer.e("drawFrame 异常", e)
                 return 33L
             } finally {
                 if (canvas != null) {
@@ -686,6 +706,15 @@ class GifWallpaperService : WallpaperService() {
             }
         }
 
+        private fun computeNextFrameDelay(): Long {
+            val rt = currentRuntime ?: return 33L
+            val inst = rt.instances.firstOrNull() ?: return 33L
+            val fc = inst.frameCount
+            val total = inst.totalDurationMs
+            if (fc <= 0 || total <= 0) return 33L
+            return (total / fc).coerceIn(8L, 50L)
+        }
+
         private fun resolveCurrentBackgroundColor(): Int {
             val animId = config.states[currentRenderStateId]?.animationId ?: return Color.BLACK
             val anim = config.animations[animId] ?: return Color.BLACK
@@ -697,7 +726,6 @@ class GifWallpaperService : WallpaperService() {
         ): RectF {
             val origW = info.width.toFloat().coerceAtLeast(1f)
             val origH = info.height.toFloat().coerceAtLeast(1f)
-
             val (scaledW, scaledH) = when (ref.scaleMode) {
                 ScaleMode.PERCENT -> {
                     val s = (ref.scaleValue / 100f).coerceAtLeast(0.01f)
@@ -708,33 +736,26 @@ class GifWallpaperService : WallpaperService() {
                     targetW to origH * (targetW / origW)
                 }
             }
-
             val (ax, ay) = ref.anchor.normalized()
             val (tx, ty) = ref.targetAnchor.normalized()
-
             val targetX = screenW * tx + ref.offsetX
             val targetY = screenH * ty + ref.offsetY
-
             val left = targetX - scaledW * ax
             val top = targetY - scaledH * ay
             return RectF(left, top, left + scaledW, top + scaledH)
         }
 
         private fun buildDebugState(now: Long, isAlarm: Boolean): DebugOverlayRenderer.DebugState {
-            val primaryInfo = currentRuntime.firstOrNull()?.info
-            val frameIdx: Int = if (primaryInfo != null && primaryInfo.frameCount > 0 && primaryInfo.totalDelayMs > 0) {
-                val elapsed = (now - playback.stateEnterTimeMs()) % primaryInfo.totalDelayMs
-                var idx = primaryInfo.frameEndTimes.indexOfFirst { it > elapsed }
-                if (idx == -1) idx = primaryInfo.frameCount - 1
-                idx
-            } else -1
+            val primaryInst = currentRuntime?.instances?.firstOrNull()
+            val frameIdx = try {
+                primaryInst?.gifDrawable?.currentFrameIndex ?: -1
+            } catch (_: Throwable) { -1 }
+            val frameTotal = primaryInst?.frameCount ?: 0
 
             val motion = motionTracker.state
             val touch = touchTracker.state
-
             val state = config.states[playback.currentStateId()]
             val anim = state?.let { config.animations[it.animationId] }
-
             val sensorStatus = when {
                 gravityRegistered && accelRegistered -> "GRAVITY+ACCEL"
                 gravityRegistered -> "仅GRAVITY"
@@ -742,16 +763,14 @@ class GifWallpaperService : WallpaperService() {
                 else -> "未注册"
             }
 
+            val infoNow = if (now < infoMsgUntil) infoMsg else ""
+
             return DebugOverlayRenderer.DebugState(
-                stateName = if (state != null) {
-                    formatStateDisplay(state)
-                } else {
-                    playback.currentStateId().ifEmpty { "None" }
-                },
+                stateName = if (state != null) formatStateDisplay(state) else playback.currentStateId().ifEmpty { "None" },
                 currentPlayCount = playback.completedCycles(),
                 targetSelfPlay = playback.targetCycles(),
                 frameIndex = frameIdx,
-                frameCount = primaryInfo?.frameCount ?: 0,
+                frameCount = frameTotal,
                 drawTimeMs = drawTimeMs,
                 limitDrawTime = limitDrawTime,
                 currentMemMb = currentMemMb,
@@ -759,7 +778,7 @@ class GifWallpaperService : WallpaperService() {
                 frameIntervalMs = frameIntervalMs,
                 isAlarm = isAlarm,
                 hasError = loadErrorMsg.isNotEmpty(),
-                frameIndexIsEstimate = true,
+                frameIndexIsEstimate = false,
                 animationDisplay = if (anim != null) formatAnimDisplay(anim) else "无",
                 postureText = motion.postureText,
                 lastShakeText = motion.lastShakeText,
@@ -768,9 +787,9 @@ class GifWallpaperService : WallpaperService() {
                 sensorStatus = sensorStatus,
                 isShaking = motionTracker.isShaking(),
                 isTouching = touch.isTouching,
-                onAnimationEndCount = onAnimationEndCount,
                 enterStateCount = enterStateCount,
-                cycleTimerCount = cycleTimerCount
+                cycleTimerCount = cycleTimerCount,
+                infoMessage = infoNow
             )
         }
     }

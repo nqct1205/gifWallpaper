@@ -44,7 +44,7 @@ java = ["src/test/java", "src/test/kotlin"]
 resources = ["src/test/resources"]
 
 [dependencies]
-implementation = ["kotlin-stdlib"]
+implementation = ["kotlin-stdlib", "pl.droidsonroids.gif:android-gif-drawable:1.2.32"]
 
 [android]
 namespace = "com.nqct.gifWallpaper"

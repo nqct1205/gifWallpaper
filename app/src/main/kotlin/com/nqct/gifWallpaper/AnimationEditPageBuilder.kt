@@ -78,14 +78,14 @@ class AnimationEditPageBuilder(
             gravity = Gravity.CENTER_VERTICAL
         }
         topBar.addView(Button(activity).apply {
-            text = "< 返回"
-            setOnClickListener { callbacks.onBack() }
+                text = "< 返回"
+                setOnClickListener { callbacks.onBack() }
         })
         topBar.addView(TextView(activity).apply {
-            text = "编辑动画"
-            textSize = 20f
-            setTypeface(null, Typeface.BOLD)
-            setPadding(20, 0, 0, 0)
+                text = "编辑动画"
+                textSize = 20f
+                setTypeface(null, Typeface.BOLD)
+                setPadding(20, 0, 0, 0)
         })
         root.addView(topBar)
 
@@ -103,10 +103,10 @@ class AnimationEditPageBuilder(
             refContainer.removeAllViews()
             if (animation.resources.isEmpty()) {
                 refContainer.addView(TextView(activity).apply {
-                    text = "尚未添加资源引用"
-                    textSize = 13f
-                    setTextColor(Color.GRAY)
-                    setPadding(20, 20, 20, 20)
+                        text = "尚未添加资源引用"
+                        textSize = 13f
+                        setTextColor(Color.GRAY)
+                        setPadding(20, 20, 20, 20)
                 })
             } else {
                 animation.resources.forEachIndexed { idx, ref ->
@@ -121,17 +121,17 @@ class AnimationEditPageBuilder(
 
         // ---- 添加引用 ----
         root.addView(Button(activity).apply {
-            text = "+ 添加资源引用"
-            setOnClickListener {
-                val sortedIds = config.resources.keys.sorted()
-                if (sortedIds.isEmpty()) {
-                    Toast.makeText(activity, "请先在「资源」页面导入 GIF", Toast.LENGTH_SHORT).show()
-                    return@setOnClickListener
+                text = "+ 添加资源引用"
+                setOnClickListener {
+                    val sortedIds = config.resources.keys.sorted()
+                    if (sortedIds.isEmpty()) {
+                        Toast.makeText(activity, "请先在「资源」页面导入 GIF", Toast.LENGTH_SHORT).show()
+                        return@setOnClickListener
+                    }
+                    animation.resources.add(AnimationResourceRef(resourceId = sortedIds.first()))
+                    refreshAll()
                 }
-                animation.resources.add(AnimationResourceRef(resourceId = sortedIds.first()))
-                refreshAll()
-            }
-        }, matchWrap(top = 10, bottom = 20))
+            }, matchWrap(top = 10, bottom = 20))
 
         // ---- 底部操作 ----
         root.addView(buildBottomBar())
@@ -152,36 +152,36 @@ class AnimationEditPageBuilder(
             gravity = Gravity.CENTER_VERTICAL
         }
         row.addView(TextView(activity).apply {
-            text = "名称: "
-            textSize = 14f
+                text = "名称: "
+                textSize = 14f
         })
 
         val etName = EditText(activity).apply {
             setText(animation.name)
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             addTextChangedListener(object : SimpleTextWatcher() {
-                override fun afterTextChanged(s: Editable?) {
-                    animation.name = s?.toString() ?: ""
-                }
+                    override fun afterTextChanged(s: Editable?) {
+                        animation.name = s?.toString() ?: ""
+                    }
             })
         }
         row.addView(etName)
 
         row.addView(Button(activity).apply {
-            text = "用资源名"
-            textSize = 12f
-            setOnClickListener {
-                val firstRef = animation.resources.firstOrNull()
-                val resource = firstRef?.let { config.resources[it.resourceId] }
-                if (resource == null) {
-                    Toast.makeText(activity, "尚未引用任何资源", Toast.LENGTH_SHORT).show()
-                    return@setOnClickListener
+                text = "用资源名"
+                textSize = 12f
+                setOnClickListener {
+                    val firstRef = animation.resources.firstOrNull()
+                    val resource = firstRef?.let { config.resources[it.resourceId] }
+                    if (resource == null) {
+                        Toast.makeText(activity, "尚未引用任何资源", Toast.LENGTH_SHORT).show()
+                        return@setOnClickListener
+                    }
+                    val newName = resource.id
+                    animation.name = newName
+                    etName.setText(newName)
+                    etName.setSelection(newName.length)
                 }
-                val newName = resource.id
-                animation.name = newName
-                etName.setText(newName)
-                etName.setSelection(newName.length)
-            }
         })
         return row
     }
@@ -202,9 +202,9 @@ class AnimationEditPageBuilder(
         }
 
         section.addView(TextView(activity).apply {
-            text = "背景填充色"
-            textSize = 15f
-            setTypeface(null, Typeface.BOLD)
+                text = "背景填充色"
+                textSize = 15f
+                setTypeface(null, Typeface.BOLD)
         })
 
         val inputRow = LinearLayout(activity).apply {
@@ -224,32 +224,33 @@ class AnimationEditPageBuilder(
             setText(animation.backgroundColor)
             textSize = 13f
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                .apply { leftMargin = 10 }
+            .apply { leftMargin = 10 }
             addTextChangedListener(object : SimpleTextWatcher() {
-                override fun afterTextChanged(s: Editable?) {
-                    val raw = s?.toString()?.trim() ?: ""
-                    animation.backgroundColor = raw
-                    preview.setBackgroundColor(parseColorSafe(raw) ?: Color.BLACK)
-                }
+                    override fun afterTextChanged(s: Editable?) {
+                        val raw = s?.toString()?.trim() ?: ""
+                        animation.backgroundColor = raw
+                        preview.setBackgroundColor(parseColorSafe(raw) ?: Color.BLACK)
+                    }
             })
         }
+
         // 失焦时规范化：合法则写回规范形式；非法/空则保留原样供用户继续修改
-        etColor.setOnFocusChangeListener { view, hasFocus ->
+        etColor.setOnFocusChangeListener { _, hasFocus ->
             if (hasFocus) return@setOnFocusChangeListener
-            val raw = (view as EditText).text?.toString()?.trim() ?: ""
+            val raw = etColor.text?.toString()?.trim() ?: ""
             val parsed = parseColorSafe(raw) ?: return@setOnFocusChangeListener
             val normalized = formatArgbColor(parsed)
             if (normalized != raw) {
-                (view as EditText).setText(normalized)
-                (view as EditText).setSelection(normalized.length)
+                etColor.setText(normalized)
+                etColor.setSelection(normalized.length)
             }
         }
         inputRow.addView(etColor)
 
         inputRow.addView(Button(activity).apply {
-            text = "吸管"
-            textSize = 12f
-            setOnClickListener { openColorPicker(animation, etColor, preview) }
+                text = "吸管"
+                textSize = 12f
+                setOnClickListener { openColorPicker(animation, etColor, preview) }
         })
         section.addView(inputRow)
 
@@ -257,23 +258,23 @@ class AnimationEditPageBuilder(
         val referenceColors = collectReferenceColors(animation)
         if (referenceColors.isNotEmpty()) {
             section.addView(TextView(activity).apply {
-                text = "参考颜色（其他动画的背景色）"
-                textSize = 12f
-                setTextColor(Color.GRAY)
-                setPadding(0, 12, 0, 6)
+                    text = "参考颜色（其他动画的背景色）"
+                    textSize = 12f
+                    setTextColor(Color.GRAY)
+                    setPadding(0, 12, 0, 6)
             })
             val colorRow = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
             for (hex in referenceColors) {
                 val colorInt = parseColorSafe(hex) ?: continue
                 colorRow.addView(View(activity).apply {
-                    layoutParams = LinearLayout.LayoutParams(48, 48).apply { rightMargin = 8 }
-                    setBackgroundColor(colorInt)
-                    setOnClickListener {
-                        animation.backgroundColor = hex
-                        etColor.setText(hex)
-                        etColor.setSelection(hex.length)
-                        preview.setBackgroundColor(colorInt)
-                    }
+                        layoutParams = LinearLayout.LayoutParams(48, 48).apply { rightMargin = 8 }
+                        setBackgroundColor(colorInt)
+                        setOnClickListener {
+                            animation.backgroundColor = hex
+                            etColor.setText(hex)
+                            etColor.setSelection(hex.length)
+                            preview.setBackgroundColor(colorInt)
+                        }
                 })
             }
             section.addView(colorRow)
@@ -289,12 +290,12 @@ class AnimationEditPageBuilder(
      */
     private fun collectReferenceColors(current: AnimationItem): List<String> {
         return config.animations.values
-            .asSequence()
-            .filter { it.id != current.id && it.backgroundColor.isNotBlank() }
-            .mapNotNull { parseColorSafe(it.backgroundColor) }
-            .map { formatArgbColor(it) }
-            .distinct()
-            .toList()
+        .asSequence()
+        .filter { it.id != current.id && it.backgroundColor.isNotBlank() }
+        .mapNotNull { parseColorSafe(it.backgroundColor) }
+        .map { formatArgbColor(it) }
+        .distinct()
+        .toList()
     }
 
     /**
@@ -317,27 +318,27 @@ class AnimationEditPageBuilder(
             return
         }
         AlertDialog.Builder(activity)
-            .setTitle("选择用于吸色的 GIF")
-            .setItems(ids.toTypedArray()) { _, which ->
-                val resId = ids[which]
-                val resource = config.resources[resId] ?: return@setItems
-                val file = File(ProjectConfigStore.animDir(activity), resource.fileName)
-                loadFirstFrameBitmapAsync(file) { bitmap ->
-                    if (bitmap == null) {
-                        Toast.makeText(activity, "图片解码失败", Toast.LENGTH_SHORT).show()
-                        return@loadFirstFrameBitmapAsync
-                    }
-                    ColorPickerDialog.show(activity, bitmap) { color ->
-                        val hex = formatArgbColor(color)
-                        animation.backgroundColor = hex
-                        etColor.setText(hex)
-                        etColor.setSelection(hex.length)
-                        preview.setBackgroundColor(color)
-                    }
+        .setTitle("选择用于吸色的 GIF")
+        .setItems(ids.toTypedArray()) { _, which ->
+            val resId = ids[which]
+            val resource = config.resources[resId] ?: return@setItems
+            val file = File(ProjectConfigStore.animDir(activity), resource.fileName)
+            loadFirstFrameBitmapAsync(file) { bitmap ->
+                if (bitmap == null) {
+                    Toast.makeText(activity, "图片解码失败", Toast.LENGTH_SHORT).show()
+                    return@loadFirstFrameBitmapAsync
+                }
+                ColorPickerDialog.show(activity, bitmap) { color ->
+                    val hex = formatArgbColor(color)
+                    animation.backgroundColor = hex
+                    etColor.setText(hex)
+                    etColor.setSelection(hex.length)
+                    preview.setBackgroundColor(color)
                 }
             }
-            .setNegativeButton("取消", null)
-            .show()
+        }
+        .setNegativeButton("取消", null)
+        .show()
     }
 
     /**
@@ -396,18 +397,18 @@ class AnimationEditPageBuilder(
             gravity = Gravity.CENTER_VERTICAL
         }
         header.addView(TextView(activity).apply {
-            text = "资源引用 #${index + 1}"
-            textSize = 15f
-            setTypeface(null, Typeface.BOLD)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                text = "资源引用 #${index + 1}"
+                textSize = 15f
+                setTypeface(null, Typeface.BOLD)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         })
         header.addView(Button(activity).apply {
-            text = "移除"
-            setTextColor(Color.RED)
-            setOnClickListener {
-                animation.resources.remove(ref)
-                refreshAll()
-            }
+                text = "移除"
+                setTextColor(Color.RED)
+                setOnClickListener {
+                    animation.resources.remove(ref)
+                    refreshAll()
+                }
         })
         card.addView(header)
 
@@ -416,43 +417,43 @@ class AnimationEditPageBuilder(
         val resource = config.resources[ref.resourceId]
         val info = resource?.info
         card.addView(TextView(activity).apply {
-            text = if (info != null) {
-                "原尺寸: ${info.width}x${info.height}  |  ${info.frameCount} 帧  |  ${info.totalDelayMs / 1000f} 秒"
-            } else {
-                "（资源未解析）"
-            }
-            textSize = 12f
-            setTextColor(if (info != null) Color.GRAY else Color.RED)
-            setPadding(0, 5, 0, 5)
+                text = if (info != null) {
+                    "原尺寸: ${info.width}x${info.height}  |  ${info.frameCount} 帧  |  ${info.totalDelayMs / 1000f} 秒"
+                } else {
+                    "（资源未解析）"
+                }
+                textSize = 12f
+                setTextColor(if (info != null) Color.GRAY else Color.RED)
+                setPadding(0, 5, 0, 5)
         })
 
         card.addView(buildQuickAlignRow(ref, refreshAll), matchWrap(top = 5, bottom = 5))
 
         card.addView(TextView(activity).apply {
-            text = "GIF 锚点（缩放/对齐中心）"
-            textSize = 13f
-            setPadding(0, 10, 0, 5)
+                text = "GIF 锚点（缩放/对齐中心）"
+                textSize = 13f
+                setPadding(0, 10, 0, 5)
         })
         card.addView(buildAnchorSelector(ref, SelectorType.ANCHOR))
 
         card.addView(TextView(activity).apply {
-            text = "屏幕目标锚点（对齐位置）"
-            textSize = 13f
-            setPadding(0, 10, 0, 5)
+                text = "屏幕目标锚点（对齐位置）"
+                textSize = 13f
+                setPadding(0, 10, 0, 5)
         })
         card.addView(buildAnchorSelector(ref, SelectorType.TARGET))
 
         card.addView(TextView(activity).apply {
-            text = "缩放"
-            textSize = 13f
-            setPadding(0, 10, 0, 5)
+                text = "缩放"
+                textSize = 13f
+                setPadding(0, 10, 0, 5)
         })
         card.addView(buildScaleRow(ref, info))
 
         card.addView(TextView(activity).apply {
-            text = "额外偏移（像素，正向右 / 下）"
-            textSize = 13f
-            setPadding(0, 10, 0, 5)
+                text = "额外偏移（像素，正向右 / 下）"
+                textSize = 13f
+                setPadding(0, 10, 0, 5)
         })
         card.addView(buildOffsetRow(ref))
 
@@ -465,16 +466,16 @@ class AnimationEditPageBuilder(
             gravity = Gravity.CENTER_VERTICAL
         }
         row.addView(TextView(activity).apply {
-            text = "资源: "
-            textSize = 13f
+                text = "资源: "
+                textSize = 13f
         })
 
         val sortedIds = config.resources.keys.sorted()
         if (sortedIds.isEmpty()) {
             row.addView(TextView(activity).apply {
-                text = "无可用资源"
-                textSize = 13f
-                setTextColor(Color.RED)
+                    text = "无可用资源"
+                    textSize = 13f
+                    setTextColor(Color.RED)
             })
             return row
         }
@@ -517,37 +518,37 @@ class AnimationEditPageBuilder(
         val row = LinearLayout(activity).apply { orientation = LinearLayout.HORIZONTAL }
 
         row.addView(Button(activity).apply {
-            text = "居中"
-            textSize = 12f
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener {
-                ref.anchor = AnchorPoint.CENTER
-                ref.targetAnchor = AnchorPoint.CENTER
-                refreshAll()
-            }
+                text = "居中"
+                textSize = 12f
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                setOnClickListener {
+                    ref.anchor = AnchorPoint.CENTER
+                    ref.targetAnchor = AnchorPoint.CENTER
+                    refreshAll()
+                }
         })
         row.addView(Button(activity).apply {
-            text = "底部对齐"
-            textSize = 12f
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener {
-                ref.anchor = AnchorPoint.BOTTOM_CENTER
-                ref.targetAnchor = AnchorPoint.BOTTOM_CENTER
-                refreshAll()
-            }
+                text = "底部对齐"
+                textSize = 12f
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                setOnClickListener {
+                    ref.anchor = AnchorPoint.BOTTOM_CENTER
+                    ref.targetAnchor = AnchorPoint.BOTTOM_CENTER
+                    refreshAll()
+                }
         })
         row.addView(Button(activity).apply {
-            text = "铺满宽度"
-            textSize = 12f
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener {
-                val screenW = activity.resources.displayMetrics.widthPixels
-                ref.scaleMode = ScaleMode.PIXEL
-                ref.scaleValue = screenW.toFloat()
-                ref.anchor = AnchorPoint.BOTTOM_CENTER
-                ref.targetAnchor = AnchorPoint.BOTTOM_CENTER
-                refreshAll()
-            }
+                text = "铺满宽度"
+                textSize = 12f
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                setOnClickListener {
+                    val screenW = activity.resources.displayMetrics.widthPixels
+                    ref.scaleMode = ScaleMode.PIXEL
+                    ref.scaleValue = screenW.toFloat()
+                    ref.anchor = AnchorPoint.BOTTOM_CENTER
+                    ref.targetAnchor = AnchorPoint.BOTTOM_CENTER
+                    refreshAll()
+                }
         })
         return row
     }
@@ -663,10 +664,10 @@ class AnimationEditPageBuilder(
         updateEquiv()
 
         etValue.addTextChangedListener(object : SimpleTextWatcher() {
-            override fun afterTextChanged(s: Editable?) {
-                ref.scaleValue = s?.toString()?.toFloatOrNull() ?: ref.scaleValue
-                updateEquiv()
-            }
+                override fun afterTextChanged(s: Editable?) {
+                    ref.scaleValue = s?.toString()?.toFloatOrNull() ?: ref.scaleValue
+                    updateEquiv()
+                }
         })
 
         group.setOnCheckedChangeListener { _, checkedId ->
@@ -675,9 +676,9 @@ class AnimationEditPageBuilder(
             val oldValue = ref.scaleValue
             val newValue = when {
                 ref.scaleMode == ScaleMode.PERCENT && newMode == ScaleMode.PIXEL ->
-                    origW * (oldValue / 100f)
+                origW * (oldValue / 100f)
                 ref.scaleMode == ScaleMode.PIXEL && newMode == ScaleMode.PERCENT ->
-                    oldValue / origW * 100f
+                oldValue / origW * 100f
                 else -> oldValue
             }
             ref.scaleMode = newMode
@@ -698,33 +699,33 @@ class AnimationEditPageBuilder(
 
         row.addView(TextView(activity).apply { text = "X:"; textSize = 13f })
         row.addView(EditText(activity).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER or
+                inputType = InputType.TYPE_CLASS_NUMBER or
                 InputType.TYPE_NUMBER_FLAG_SIGNED or InputType.TYPE_NUMBER_FLAG_DECIMAL
-            setText(formatNum(ref.offsetX))
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            addTextChangedListener(object : SimpleTextWatcher() {
-                override fun afterTextChanged(s: Editable?) {
-                    ref.offsetX = s?.toString()?.toFloatOrNull() ?: 0f
-                }
-            })
+                setText(formatNum(ref.offsetX))
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                addTextChangedListener(object : SimpleTextWatcher() {
+                        override fun afterTextChanged(s: Editable?) {
+                            ref.offsetX = s?.toString()?.toFloatOrNull() ?: 0f
+                        }
+                })
         })
         row.addView(TextView(activity).apply {
-            text = "px"
-            textSize = 13f
-            setPadding(5, 0, 20, 0)
+                text = "px"
+                textSize = 13f
+                setPadding(5, 0, 20, 0)
         })
 
         row.addView(TextView(activity).apply { text = "Y:"; textSize = 13f })
         row.addView(EditText(activity).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER or
+                inputType = InputType.TYPE_CLASS_NUMBER or
                 InputType.TYPE_NUMBER_FLAG_SIGNED or InputType.TYPE_NUMBER_FLAG_DECIMAL
-            setText(formatNum(ref.offsetY))
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            addTextChangedListener(object : SimpleTextWatcher() {
-                override fun afterTextChanged(s: Editable?) {
-                    ref.offsetY = s?.toString()?.toFloatOrNull() ?: 0f
-                }
-            })
+                setText(formatNum(ref.offsetY))
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                addTextChangedListener(object : SimpleTextWatcher() {
+                        override fun afterTextChanged(s: Editable?) {
+                            ref.offsetY = s?.toString()?.toFloatOrNull() ?: 0f
+                        }
+                })
         })
         row.addView(TextView(activity).apply { text = "px"; textSize = 13f; setPadding(5, 0, 0, 0) })
 
@@ -737,17 +738,17 @@ class AnimationEditPageBuilder(
             setPadding(0, 20, 0, 0)
         }
         row.addView(Button(activity).apply {
-            text = "保存并返回"
-            setBackgroundColor(Color.parseColor("#4CAF50"))
-            setTextColor(Color.WHITE)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener { callbacks.onSaved() }
+                text = "保存并返回"
+                setBackgroundColor(Color.parseColor("#4CAF50"))
+                setTextColor(Color.WHITE)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                setOnClickListener { callbacks.onSaved() }
         })
         row.addView(Button(activity).apply {
-            text = "删除动画"
-            setTextColor(Color.RED)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener { callbacks.onDelete() }
+                text = "删除动画"
+                setTextColor(Color.RED)
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                setOnClickListener { callbacks.onDelete() }
         })
         return row
     }
@@ -761,5 +762,5 @@ class AnimationEditPageBuilder(
 
     /** 整数值不带小数，非整数保留一位小数。 */
     private fun formatNum(v: Float): String =
-        if (v == v.toLong().toFloat()) v.toLong().toString() else String.format("%.1f", v)
+    if (v == v.toLong().toFloat()) v.toLong().toString() else String.format("%.1f", v)
 }

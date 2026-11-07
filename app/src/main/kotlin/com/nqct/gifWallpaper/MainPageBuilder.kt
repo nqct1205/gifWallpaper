@@ -19,9 +19,6 @@ import android.widget.TextView
 import java.util.Locale
 
 // 主页面构建器。
-// 展示：警告条 / 各入口卡片 / 默认状态 / 数据备份 / 应用壁纸 + 恢复系统默认 /
-// 传感器与交互（3 开关 + 摇一摇灵敏度） / 调试设置。
-// 职责边界：只负责 UI 与触发回调；数据修改与持久化由 MainActivity 完成。
 class MainPageBuilder(
     private val activity: Activity,
     private val config: ProjectConfig,
@@ -37,13 +34,13 @@ class MainPageBuilder(
         fun onOpenStateGraph()
         fun onSetDefaultState()
         fun onApplyWallpaper()
-        // 恢复手机系统默认壁纸（清除动态壁纸，配置参数保留）
         fun onRestoreSystemWallpaper()
-
         fun onExportJson()
         fun onExportZip()
         fun onImportJson()
         fun onImportZip()
+        // 新增：导出调试日志
+        fun onExportLog()
     }
 
     fun build(): View {
@@ -53,7 +50,6 @@ class MainPageBuilder(
             setBackgroundColor(Color.parseColor("#F5F5F5"))
         }
 
-        // 标题
         root.addView(TextView(activity).apply {
             text = "GIF 动态壁纸"
             textSize = 24f
@@ -62,7 +58,6 @@ class MainPageBuilder(
             setPadding(0, 0, 0, 30)
         })
 
-        // 警告条
         if (!warningMessage.isNullOrBlank()) {
             root.addView(TextView(activity).apply {
                 text = warningMessage
@@ -73,7 +68,6 @@ class MainPageBuilder(
             }, matchWrapWithMargins(bottom = 20))
         }
 
-        // 入口卡片
         root.addView(buildEntryCard("资源", config.resources.size) { callbacks.onOpenResources() },
             matchWrapWithMargins(bottom = 10))
         root.addView(buildEntryCard("动画", config.animations.size) { callbacks.onOpenAnimations() },
@@ -85,19 +79,11 @@ class MainPageBuilder(
         root.addView(buildEntryCard("状态图", config.states.size) { callbacks.onOpenStateGraph() },
             matchWrapWithMargins(bottom = 20))
 
-        // 默认状态
         root.addView(buildDefaultStateRow(), matchWrapWithMargins(bottom = 20))
 
-        // 数据备份
         buildBackupSection(root)
-
-        // 传感器与交互（全局开关 + 灵敏度）
         buildSensorAndInteractionSection(root)
-
-        // 应用壁纸 + 恢复系统默认壁纸
         buildWallpaperActions(root)
-
-        // 调试设置
         buildMonitorSettings(root)
 
         return root
@@ -136,8 +122,6 @@ class MainPageBuilder(
 
     // ==================== 传感器与交互 ====================
 
-    // 全局开关与摇一摇灵敏度。写入 SharedPreferences "PetPrefs"，
-    // 壁纸服务已注册监听，实时生效。
     private fun buildSensorAndInteractionSection(root: LinearLayout) {
         val prefs = activity.getSharedPreferences("PetPrefs", Context.MODE_PRIVATE)
 
@@ -176,44 +160,70 @@ class MainPageBuilder(
             }
         })
 
-        // 摇一摇灵敏度滑块：1.5g - 4.0g，步长 0.1
-        // 值越小越灵敏（更容易触发）；值越大越迟钝。
         val currentSensitivity = prefs.getFloat("shakeSensitivity", 2.4f)
-        val labelTv = TextView(activity).apply {
-            text = sensitivityLabel(currentSensitivity)
+        val sensitivityLabel = TextView(activity).apply {
+            text = sensitivityLabelText(currentSensitivity)
             textSize = 14f
             setPadding(0, 15, 0, 5)
         }
-        root.addView(labelTv)
+        root.addView(sensitivityLabel)
 
-        val seekBar = SeekBar(activity).apply {
-            // progress 范围 0..25，映射到 1.5..4.0
+        val sensitivitySeek = SeekBar(activity).apply {
             max = 25
             progress = ((currentSensitivity * 10f) - 15f).toInt().coerceIn(0, 25)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
                     val g = (progress + 15) / 10f
-                    labelTv.text = sensitivityLabel(g)
-                    if (fromUser) {
-                        prefs.edit().putFloat("shakeSensitivity", g).apply()
-                    }
+                    sensitivityLabel.text = sensitivityLabelText(g)
+                    if (fromUser) prefs.edit().putFloat("shakeSensitivity", g).apply()
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
             })
         }
-        root.addView(seekBar)
-
+        root.addView(sensitivitySeek)
         root.addView(TextView(activity).apply {
             text = "说明：静止时约 1.0g，轻摇约 1.5~2.0g，正常摇约 2.5~3.5g。数值越低越灵敏。"
             textSize = 11f
             setTextColor(Color.GRAY)
             setPadding(0, 5, 0, 0)
         })
+
+        val currentCooldown = prefs.getLong("shakeCooldownMs", 1200L)
+        val cooldownLabel = TextView(activity).apply {
+            text = cooldownLabelText(currentCooldown)
+            textSize = 14f
+            setPadding(0, 15, 0, 5)
+        }
+        root.addView(cooldownLabel)
+
+        val cooldownSeek = SeekBar(activity).apply {
+            max = 27
+            progress = ((currentCooldown - 300L) / 100L).toInt().coerceIn(0, 27)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                    val ms = 300L + progress * 100L
+                    cooldownLabel.text = cooldownLabelText(ms)
+                    if (fromUser) prefs.edit().putLong("shakeCooldownMs", ms).apply()
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        }
+        root.addView(cooldownSeek)
+        root.addView(TextView(activity).apply {
+            text = "说明：冷却时间越长，两次摇一摇触发之间的最小间隔越大，可避免误触抖动。"
+            textSize = 11f
+            setTextColor(Color.GRAY)
+            setPadding(0, 5, 0, 0)
+        })
     }
 
-    private fun sensitivityLabel(g: Float): String =
+    private fun sensitivityLabelText(g: Float): String =
         "摇一摇灵敏度: ${String.format(Locale.US, "%.1f", g)}g（越低越灵敏）"
+
+    private fun cooldownLabelText(ms: Long): String =
+        "摇一摇冷却: ${ms}ms（越长越不易连续触发）"
 
     // ==================== 壁纸操作 ====================
 
@@ -274,6 +284,24 @@ class MainPageBuilder(
 
         root.addView(buildNumberInputRow("渲染耗时上限: ", " ms", "limitDraw", 20))
         root.addView(buildNumberInputRow("内存占用上限: ", " MB", "limitMem", 150))
+
+        // 日志导出
+        root.addView(TextView(activity).apply {
+            text = "调试日志"
+            textSize = 14f
+            setTypeface(null, Typeface.BOLD)
+            setPadding(0, 20, 0, 5)
+        })
+        root.addView(Button(activity).apply {
+            text = "导出日志（${LogBuffer.size()} 条）"
+            setOnClickListener { callbacks.onExportLog() }
+        }, matchWrapWithMargins(bottom = 5))
+        root.addView(TextView(activity).apply {
+            text = "导出后可分享或保存。包含状态切换、传感器、异常等调试信息，便于排查问题。"
+            textSize = 11f
+            setTextColor(Color.GRAY)
+            setPadding(0, 0, 0, 10)
+        })
     }
 
     // ==================== 子模块 ====================
