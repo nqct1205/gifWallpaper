@@ -1,17 +1,90 @@
 package com.nqct.gifWallpaper
 
 // 项目全量数据模型。
-// 分层：ResourceItem <- AnimationResourceRef <- AnimationItem <- StateNode
-// 引用：1 状态 -> 1 动画；1 动画 -> N 资源引用；1 资源 <- N 动画引用。
 
 // ==================== 资源层 ====================
 
-// 磁盘上的 GIF 静态资源。所有字段由文件决定，用户不可修改。
+// 资源播放模式。
+//   NATIVE：GIF 原始速度。
+//   FRAME_INTERVAL：customValue 是帧间隔（毫秒）。
+//   TOTAL_DURATION：customValue 是总时长（毫秒）。
+//
+// 【存储约定】只存一个 customValue，另一个由 frameCount 推算。
+// 保证 targetFrameIntervalMs × frameCount == targetTotalDurationMs，消除双字段不一致的可能。
+enum class ResourcePlaybackMode { NATIVE, FRAME_INTERVAL, TOTAL_DURATION }
+
 data class ResourceItem(
     val id: String,
     val fileName: String,
-    val info: GifInfo?
-)
+    val info: GifInfo?,
+    var playbackMode: ResourcePlaybackMode = ResourcePlaybackMode.NATIVE,
+    // 按 playbackMode 决定语义：FRAME_INTERVAL 时是帧间隔，TOTAL_DURATION 时是总时长。NATIVE 时忽略。
+    var customValue: Int = 0
+) {
+    // 帧数（优先 GifInfo，无效时返回 0）
+    private fun frames(): Int = info?.frameCount?.coerceAtLeast(1) ?: 0
+
+    // 原始平均帧时长（毫秒）
+    private fun origAvgMs(): Long {
+        val inf = info ?: return 0L
+        val n = inf.frameCount.coerceAtLeast(1)
+        return (inf.totalDelayMs / n).toLong().coerceAtLeast(1L)
+    }
+
+    // 目标帧间隔（每帧多久）。NATIVE 用原始平均；自定义按模式取。
+    fun targetFrameIntervalMs(): Long {
+        val inf = info ?: return 33L
+        val n = inf.frameCount.coerceAtLeast(1)
+        val origAvg = origAvgMs()
+        return when (playbackMode) {
+            ResourcePlaybackMode.NATIVE -> origAvg
+            ResourcePlaybackMode.FRAME_INTERVAL ->
+                customValue.takeIf { it > 0 }?.toLong() ?: origAvg
+            ResourcePlaybackMode.TOTAL_DURATION ->
+                if (customValue > 0) (customValue.toLong() / n).coerceAtLeast(1L)
+                else origAvg
+        }
+    }
+
+    // 目标总时长（一圈多久）。与 targetFrameIntervalMs 严格满足 × frameCount 的关系。
+    fun targetTotalDurationMs(): Long {
+        val inf = info ?: return 0L
+        val n = inf.frameCount.coerceAtLeast(1)
+        return when (playbackMode) {
+            ResourcePlaybackMode.NATIVE -> inf.totalDelayMs.toLong().coerceAtLeast(1L)
+            ResourcePlaybackMode.FRAME_INTERVAL ->
+                if (customValue > 0) (customValue.toLong() * n).coerceAtLeast(1L)
+                else inf.totalDelayMs.toLong().coerceAtLeast(1L)
+            ResourcePlaybackMode.TOTAL_DURATION ->
+                customValue.takeIf { it > 0 }?.toLong() ?: inf.totalDelayMs.toLong().coerceAtLeast(1L)
+        }
+    }
+
+    // 速度因子（GifDrawable.setSpeed 用）。= 原始平均帧时长 / 目标帧间隔。
+    fun speedFactor(): Float {
+        val inf = info ?: return 1f
+        val origAvg = origAvgMs().toFloat()
+        if (origAvg <= 0f) return 1f
+        val target = targetFrameIntervalMs().toFloat()
+        if (target <= 0f) return 1f
+        return (origAvg / target).coerceIn(0.1f, 10f)
+    }
+
+    // 用户可读的速度描述。
+    fun speedDescription(): String {
+        val inf = info ?: return "原生速度"
+        val n = inf.frameCount.coerceAtLeast(1)
+        return when (playbackMode) {
+            ResourcePlaybackMode.NATIVE -> "原生速度（${inf.totalDelayMs}ms）"
+            ResourcePlaybackMode.FRAME_INTERVAL ->
+                if (customValue <= 0) "原生速度"
+                else "帧间隔 ${customValue}ms（总 ${customValue * n}ms）"
+            ResourcePlaybackMode.TOTAL_DURATION ->
+                if (customValue <= 0) "原生速度"
+                else "总时长 ${customValue}ms（每帧约 ${customValue / n}ms）"
+        }
+    }
+}
 
 // ==================== 9 点定位 ====================
 
@@ -57,8 +130,6 @@ data class AnimationResourceRef(
 
 // ==================== 动画层 ====================
 
-// 动画项：一组资源引用。
-// backgroundColor：十六进制字符串（#RRGGBB 或 #AARRGGBB）；空串 = 不自定义，回退黑色。
 data class AnimationItem(
     var id: String = "",
     var name: String = "",
@@ -73,8 +144,6 @@ data class TransitionRule(
     var weight: Int = 1
 )
 
-// 状态节点：引用一个动画 + 周期范围 + 概率转移规则。
-// id 不可改（引用键）；name 用户可编辑，仅展示用。
 data class StateNode(
     var id: String = "",
     var name: String = "",
@@ -104,15 +173,11 @@ enum class EventType(val label: String) {
     CLICK("点击")
 }
 
-// 附加条件：事件触发瞬间需满足的快照条件。
-// 当前仅支持 ORIENTATION（param = DeviceOrientation.name），结构为未来扩展预留。
 data class EventCondition(
     var type: EventType = EventType.ORIENTATION,
     var param: String = ""
 )
 
-// 事件驱动规则。
-// 匹配流程：主事件匹配 -> 当前状态在 sourceStateIds -> 所有 conditions 满足 -> 跳转。
 data class EventRule(
     var id: String = "",
     var type: EventType = EventType.ORIENTATION,
@@ -131,10 +196,8 @@ class ProjectConfig {
     val states = mutableMapOf<String, StateNode>()
     val eventRules = mutableListOf<EventRule>()
 
-    // 引用完整性检查，返回问题列表（空表示健康）。
     fun validate(): List<String> {
         val issues = mutableListOf<String>()
-
         if (defaultStateId.isNotEmpty() && states[defaultStateId] == null) {
             issues.add("默认状态不存在: $defaultStateId")
         }
@@ -167,10 +230,6 @@ class ProjectConfig {
         }
         return issues
     }
-
-    // ==================== 重排 ====================
-    // 用于拖动排序。索引语义：toIndex 是"最终位置"（原数组视角）。
-    // 内部先移除再插入，LinkedHashMap 保持插入顺序。
 
     fun reorderResources(from: Int, to: Int) {
         val list = resources.entries.toMutableList()

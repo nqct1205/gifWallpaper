@@ -6,9 +6,16 @@ import org.json.JSONObject
 import java.io.File
 
 // 项目配置加载 / 保存 / 与磁盘同步。
+//
 // 持久化只存"用户配置"，不存解析缓存（ResourceItem.info 重新解析）。
 // 加载时与磁盘 GIF 列表同步：新增补建、缺失清理引用。
 // JSON 损坏返回 Corrupted，不静默覆盖磁盘。
+//
+// 【资源速度存储】只存 customValue 一个字段，语义由 playbackMode 决定：
+//   NATIVE          -> customValue 忽略
+//   FRAME_INTERVAL  -> customValue = 帧间隔（ms）
+//   TOTAL_DURATION  -> customValue = 总时长（ms）
+// 另一个时间参数不存储，由 ResourceItem 的方法从 customValue + frameCount 推导。
 object ProjectConfigStore {
 
     const val CONFIG_FILE = "project.json"
@@ -66,7 +73,13 @@ object ProjectConfigStore {
             val id = obj.optString("id", "")
             val fileName = obj.optString("fileName", "")
             if (id.isEmpty() || fileName.isEmpty()) continue
-            config.resources[id] = ResourceItem(id, fileName, null)
+            config.resources[id] = ResourceItem(
+                id = id,
+                fileName = fileName,
+                info = null,
+                playbackMode = parsePlaybackMode(obj.optString("playbackMode", "NATIVE")),
+                customValue = obj.optInt("customValue", 0)
+            )
         }
 
         val animsArr = json.optJSONArray("animations") ?: JSONArray()
@@ -149,7 +162,6 @@ object ProjectConfigStore {
                 val sid = srcArr.optString(j, "")
                 if (sid.isNotEmpty()) rule.sourceStateIds.add(sid)
             }
-            // 附加条件（当前仅解析方向条件）
             val condArr = obj.optJSONArray("conditions") ?: JSONArray()
             for (j in 0 until condArr.length()) {
                 val cObj = condArr.optJSONObject(j) ?: continue
@@ -158,7 +170,6 @@ object ProjectConfigStore {
                 if (cType == EventType.ORIENTATION && isValidOrientationName(cParam)) {
                     rule.conditions.add(EventCondition(cType, cParam))
                 }
-                // 其他类型的条件暂不解析（未来扩展）
             }
             config.eventRules.add(rule)
         }
@@ -178,6 +189,8 @@ object ProjectConfigStore {
                 resArr.put(JSONObject().apply {
                     put("id", r.id)
                     put("fileName", r.fileName)
+                    put("playbackMode", r.playbackMode.name)
+                    put("customValue", r.customValue)
                 })
             }
             json.put("resources", resArr)
@@ -266,6 +279,7 @@ object ProjectConfigStore {
     //   2. 缺失 GIF 移除 ResourceItem，清理引用它的 AnimationResourceRef
     //   3. 清理悬空状态 / 事件规则引用
     //   4. 校验 defaultStateId
+    //   5. 已有资源保留用户速度配置，仅更新 fileName / info
     private fun syncWithDisk(context: Context, config: ProjectConfig) {
         val dir = animDir(context)
         val files = dir.listFiles { f -> f.extension.lowercase() == "gif" } ?: emptyArray()
@@ -277,7 +291,13 @@ object ProjectConfigStore {
         for (file in files) {
             val id = file.nameWithoutExtension
             val info = GifMetadataParser.parse(file)
-            config.resources[id] = ResourceItem(id, file.name, info)
+            val existing = config.resources[id]
+            if (existing != null) {
+                // 保留用户速度配置（playbackMode / customValue），只更新文件相关字段
+                config.resources[id] = existing.copy(fileName = file.name, info = info)
+            } else {
+                config.resources[id] = ResourceItem(id, file.name, info)
+            }
         }
 
         for (anim in config.animations.values) {
@@ -312,6 +332,9 @@ object ProjectConfigStore {
 
     private fun parseEventType(name: String): EventType =
         runCatching { EventType.valueOf(name) }.getOrDefault(EventType.ORIENTATION)
+
+    private fun parsePlaybackMode(name: String): ResourcePlaybackMode =
+        runCatching { ResourcePlaybackMode.valueOf(name) }.getOrDefault(ResourcePlaybackMode.NATIVE)
 
     // 校验方向名是否合法（用于丢弃旧 FORWARD/REVERSE 与非法值）
     private fun isValidOrientationName(name: String): Boolean {

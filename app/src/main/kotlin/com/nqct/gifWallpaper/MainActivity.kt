@@ -32,6 +32,7 @@ class MainActivity : Activity() {
     private sealed class Page {
         object Main : Page()
         object ResourceList : Page()
+        data class ResourceEdit(val resourceId: String) : Page()
         object AnimationList : Page()
         data class AnimationEdit(val animationId: String) : Page()
         object StateList : Page()
@@ -103,6 +104,7 @@ class MainActivity : Activity() {
         val cur = currentPage
         val back: Page? = when (cur) {
             is Page.Main -> null
+            is Page.ResourceEdit -> Page.ResourceList
             is Page.StateEdit -> cur.returnTo
             is Page.EventRuleEdit -> cur.returnTo
             is Page.LogExport -> Page.Main
@@ -162,6 +164,7 @@ class MainActivity : Activity() {
         val content: android.view.View = when (page) {
             is Page.Main -> buildMainPage()
             is Page.ResourceList -> buildResourceListPage(scrollView)
+            is Page.ResourceEdit -> buildResourceEditPage(page.resourceId)
             is Page.AnimationList -> buildAnimationListPage(scrollView)
             is Page.AnimationEdit -> buildAnimationEditPage(page.animationId)
             is Page.StateList -> buildStateListPage(scrollView)
@@ -218,6 +221,9 @@ class MainActivity : Activity() {
             override fun onBack() { showPage(Page.Main) }
             override fun onImportGif() { selectGif() }
             override fun onDeleteResource(resourceId: String) { deleteResource(resourceId) }
+            override fun onEditResource(resourceId: String) {
+                showPage(Page.ResourceEdit(resourceId))
+            }
             override fun onReorderResources(fromIndex: Int, toIndex: Int) {
                 config.reorderResources(fromIndex, toIndex)
                 saveConfig()
@@ -226,6 +232,19 @@ class MainActivity : Activity() {
             }
         }
     ).build(scrollView)
+
+    private fun buildResourceEditPage(resourceId: String) = ResourceEditPageBuilder(
+        activity = this,
+        config = config,
+        resourceId = resourceId,
+        callbacks = object : ResourceEditPageBuilder.Callbacks {
+            override fun onBack() { showPage(Page.ResourceList) }
+            override fun onSaved() {
+                saveConfig()
+                showPage(Page.ResourceList)
+            }
+        }
+    ).build()
 
     private fun buildAnimationListPage(scrollView: ScrollView) = AnimationListPageBuilder(
         activity = this,
@@ -243,6 +262,22 @@ class MainActivity : Activity() {
             }
         }
     ).build(scrollView)
+
+    private fun buildAnimationEditPage(animationId: String) = AnimationEditPageBuilder(
+        activity = this,
+        config = config,
+        animationId = animationId,
+        callbacks = object : AnimationEditPageBuilder.Callbacks {
+            override fun onBack() {
+                saveConfig()
+                showPage(Page.AnimationList)
+            }
+            override fun onSaved() {
+                if (saveConfig()) showPage(Page.AnimationList)
+            }
+            override fun onDelete() { deleteAnimation(animationId) }
+        }
+    ).build()
 
     private fun buildStateListPage(scrollView: ScrollView) = StateListPageBuilder(
         activity = this,
@@ -265,22 +300,6 @@ class MainActivity : Activity() {
             }
         }
     ).build(scrollView)
-
-    private fun buildAnimationEditPage(animationId: String) = AnimationEditPageBuilder(
-        activity = this,
-        config = config,
-        animationId = animationId,
-        callbacks = object : AnimationEditPageBuilder.Callbacks {
-            override fun onBack() {
-                saveConfig()
-                showPage(Page.AnimationList)
-            }
-            override fun onSaved() {
-                if (saveConfig()) showPage(Page.AnimationList)
-            }
-            override fun onDelete() { deleteAnimation(animationId) }
-        }
-    ).build()
 
     private fun buildStateEditPage(page: Page.StateEdit) = StateEditPageBuilder(
         activity = this,

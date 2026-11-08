@@ -11,7 +11,8 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 
-// 资源列表页。骨架由 ListPageScaffold 提供，本类只负责数据源与 item 渲染。
+// 资源列表页。骨架由 ListPageScaffold 提供。
+// 每个卡片显示资源信息与当前播放速度；点击卡片进入编辑页。
 class ResourceListPageBuilder(
     private val activity: Activity,
     private val config: ProjectConfig,
@@ -22,6 +23,7 @@ class ResourceListPageBuilder(
         fun onBack()
         fun onImportGif()
         fun onDeleteResource(resourceId: String)
+        fun onEditResource(resourceId: String)
         fun onReorderResources(fromIndex: Int, toIndex: Int)
     }
 
@@ -59,6 +61,7 @@ class ResourceListPageBuilder(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { bottomMargin = 10 }
+            setOnClickListener { callbacks.onEditResource(id) }
         }
 
         val headerRow = LinearLayout(activity).apply {
@@ -90,6 +93,15 @@ class ResourceListPageBuilder(
             setTextColor(Color.GRAY)
             setPadding(0, 5, 0, 0)
         })
+
+        // 当前速度
+        card.addView(TextView(activity).apply {
+            text = "速度: ${res.speedDescription()}"
+            textSize = 12f
+            setTextColor(Color.parseColor("#2196F3"))
+            setPadding(0, 3, 0, 0)
+        })
+
         return card
     }
 }
