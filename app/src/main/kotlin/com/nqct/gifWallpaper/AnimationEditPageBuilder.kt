@@ -25,6 +25,15 @@ import android.widget.Toast
 import java.io.File
 
 // 动画编辑页。
+//
+// 【结束方式】
+//   多资源时提供两种结束方式（RadioGroup 二选一）：
+//     - 自动：单资源=资源自身播完；多资源=最后一个资源播完。endTimeMs = 0。
+//     - 自定义时长：持续 N 毫秒后结束，所有资源立即停止绘制。endTimeMs = N。
+//   单资源时隐藏整块（自动即资源自身时长）。
+//
+// 【返回语义】"< 返回"按钮直接调 callbacks.onBack()。
+// 是否保存由 MainActivity 判断（未修改不弹窗）。
 class AnimationEditPageBuilder(
     private val activity: Activity,
     private val config: ProjectConfig,
@@ -68,6 +77,18 @@ class AnimationEditPageBuilder(
         root.addView(buildNameRow(animation), matchWrap(top = 10, bottom = 10))
         root.addView(buildBackgroundColorSection(animation), matchWrap(bottom = 10))
 
+        // 多资源：结束方式 + 提示
+        if (animation.resources.size > 1) {
+            root.addView(buildEndTimeSection(animation), matchWrap(bottom = 10))
+            root.addView(TextView(activity).apply {
+                text = "当前动画引用了 ${animation.resources.size} 个资源。" +
+                    "每个资源可设置独立的启动延迟。"
+                textSize = 12f
+                setTextColor(Color.parseColor("#2196F3"))
+                setPadding(0, 0, 0, 10)
+            })
+        }
+
         val refContainer = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
         root.addView(refContainer)
 
@@ -94,13 +115,12 @@ class AnimationEditPageBuilder(
         root.addView(Button(activity).apply {
             text = "+ 添加资源引用"
             setOnClickListener {
-                // 资源下拉顺序跟随用户排序
-                val sortedIds = config.resources.keys.toList()
-                if (sortedIds.isEmpty()) {
+                val ids = config.resources.keys.toList()
+                if (ids.isEmpty()) {
                     Toast.makeText(activity, "请先在「资源」页面导入 GIF", Toast.LENGTH_SHORT).show()
                     return@setOnClickListener
                 }
-                animation.resources.add(AnimationResourceRef(resourceId = sortedIds.first()))
+                animation.resources.add(AnimationResourceRef(resourceId = ids.first()))
                 refreshAll()
             }
         }, matchWrap(top = 10, bottom = 20))
@@ -108,6 +128,118 @@ class AnimationEditPageBuilder(
         root.addView(buildBottomBar())
 
         return root
+    }
+
+    // ==================== 结束方式 ====================
+
+    // 计算"自动"时长的预估值（供 UI 显示）。
+    private fun computeAutoTotalMs(animation: AnimationItem): Long {
+        var maxEnd = 0L
+        for (ref in animation.resources) {
+            val resource = config.resources[ref.resourceId] ?: continue
+            val dur = resource.targetTotalDurationMs()
+            val end = ref.startDelayMs.toLong() + dur
+            if (end > maxEnd) maxEnd = end
+        }
+        return maxEnd.coerceAtLeast(1L)
+    }
+
+    private fun buildEndTimeSection(animation: AnimationItem): View {
+        val section = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(20, 20, 20, 20)
+            setBackgroundColor(Color.WHITE)
+        }
+        section.addView(TextView(activity).apply {
+            text = "结束方式"
+            textSize = 15f
+            setTypeface(null, Typeface.BOLD)
+        })
+
+        val autoTotalMs = computeAutoTotalMs(animation)
+        val autoDesc = if (animation.resources.size == 1) {
+            "自动（资源播放结束时，约 ${autoTotalMs}ms）"
+        } else {
+            "自动（最后一个资源播放结束时，约 ${autoTotalMs}ms）"
+        }
+
+        val rbAuto = RadioButton(activity).apply {
+            id = View.generateViewId()
+            text = autoDesc
+            textSize = 14f
+        }
+        val rbCustom = RadioButton(activity).apply {
+            id = View.generateViewId()
+            text = "自定义时长"
+            textSize = 14f
+        }
+        // 先设 isChecked 再 addView，避免触发多次回调
+        if (animation.endTimeMs <= 0) rbAuto.isChecked = true else rbCustom.isChecked = true
+
+        val rg = RadioGroup(activity).apply { orientation = RadioGroup.VERTICAL }
+        rg.addView(rbAuto)
+        rg.addView(rbCustom)
+        section.addView(rg)
+
+        // 自定义时长输入行
+        val customRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 10, 0, 0)
+            visibility = if (animation.endTimeMs > 0) View.VISIBLE else View.GONE
+        }
+        customRow.addView(TextView(activity).apply {
+            text = "持续: "
+            textSize = 13f
+        })
+        val etCustom = EditText(activity).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            textSize = 14f
+            val displayVal = if (animation.endTimeMs > 0) animation.endTimeMs
+                else autoTotalMs.coerceAtLeast(1000).toInt()
+            setText(displayVal.toString())
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            addTextChangedListener(object : SimpleTextWatcher() {
+                override fun afterTextChanged(s: Editable?) {
+                    val v = s?.toString()?.toIntOrNull()?.coerceAtLeast(1) ?: 1
+                    animation.endTimeMs = v
+                }
+            })
+        }
+        customRow.addView(etCustom)
+        customRow.addView(TextView(activity).apply {
+            text = " ms"
+            textSize = 13f
+            setTextColor(Color.GRAY)
+        })
+        section.addView(customRow)
+
+        section.addView(TextView(activity).apply {
+            text = "说明：\n" +
+                "· 自动：按资源自身的播放时长决定整圈结束时间。\n" +
+                "· 自定义：到达指定时长后所有资源立即停止绘制，切换到下一状态。\n" +
+                "  早于该时长播完的资源会提前消失；晚于该时长仍在播的会被截断。"
+            textSize = 11f
+            setTextColor(Color.GRAY)
+            setPadding(0, 8, 0, 0)
+        })
+
+        rg.setOnCheckedChangeListener { _, checkedId ->
+            if (checkedId == rbAuto.id) {
+                animation.endTimeMs = 0
+                customRow.visibility = View.GONE
+            } else {
+                if (animation.endTimeMs <= 0) {
+                    // 切到自定义时给一个默认值（基于自动时长）
+                    animation.endTimeMs = autoTotalMs.coerceAtLeast(1000).toInt()
+                    etCustom.setText(animation.endTimeMs.toString())
+                    etCustom.setSelection(etCustom.text?.length ?: 0)
+                }
+                customRow.visibility = View.VISIBLE
+            }
+        }
+
+        return section
     }
 
     // ==================== 名称行 ====================
@@ -191,7 +323,6 @@ class AnimationEditPageBuilder(
                 }
             })
         }
-        // 失焦时规范化：合法则写回规范形式；非法/空则保留原样
         etColor.setOnFocusChangeListener { _, hasFocus ->
             if (hasFocus) return@setOnFocusChangeListener
             val raw = etColor.text?.toString()?.trim() ?: ""
@@ -317,10 +448,9 @@ class AnimationEditPageBuilder(
         ref: AnimationResourceRef,
         refreshAll: () -> Unit
     ): View {
-        // 资源下拉顺序跟随用户排序
-        val sortedIds = config.resources.keys.toList()
-        if (sortedIds.isNotEmpty() && config.resources[ref.resourceId] == null) {
-            ref.resourceId = sortedIds.first()
+        val ids = config.resources.keys.toList()
+        if (ids.isNotEmpty() && config.resources[ref.resourceId] == null) {
+            ref.resourceId = ids.first()
         }
 
         val card = LinearLayout(activity).apply {
@@ -394,7 +524,51 @@ class AnimationEditPageBuilder(
         })
         card.addView(buildOffsetRow(ref))
 
+        // 多资源时显示启动延迟
+        if (animation.resources.size > 1) {
+            card.addView(TextView(activity).apply {
+                text = "播放时间"
+                textSize = 13f
+                setTypeface(null, Typeface.BOLD)
+                setPadding(0, 15, 0, 5)
+            })
+            card.addView(buildStartDelayRow(ref))
+            card.addView(TextView(activity).apply {
+                text = "说明：从动画开始后延迟 ${ref.startDelayMs}ms 再播放本资源。"
+                textSize = 11f
+                setTextColor(Color.GRAY)
+                setPadding(0, 3, 0, 0)
+            })
+        }
+
         return card
+    }
+
+    private fun buildStartDelayRow(ref: AnimationResourceRef): View {
+        val row = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        row.addView(TextView(activity).apply {
+            text = "启动延迟: "
+            textSize = 13f
+        })
+        row.addView(EditText(activity).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(ref.startDelayMs.toString())
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            addTextChangedListener(object : SimpleTextWatcher() {
+                override fun afterTextChanged(s: Editable?) {
+                    ref.startDelayMs = s?.toString()?.toIntOrNull()?.coerceAtLeast(0) ?: 0
+                }
+            })
+        })
+        row.addView(TextView(activity).apply {
+            text = " ms"
+            textSize = 13f
+            setTextColor(Color.GRAY)
+        })
+        return row
     }
 
     private fun buildResourceSelector(ref: AnimationResourceRef, refreshAll: () -> Unit): View {
@@ -407,9 +581,8 @@ class AnimationEditPageBuilder(
             textSize = 13f
         })
 
-        // 顺序跟随用户排序
-        val sortedIds = config.resources.keys.toList()
-        if (sortedIds.isEmpty()) {
+        val ids = config.resources.keys.toList()
+        if (ids.isEmpty()) {
             row.addView(TextView(activity).apply {
                 text = "无可用资源"
                 textSize = 13f
@@ -422,15 +595,15 @@ class AnimationEditPageBuilder(
             adapter = ArrayAdapter(
                 activity,
                 android.R.layout.simple_spinner_dropdown_item,
-                sortedIds
+                ids
             )
-            val idx = sortedIds.indexOf(ref.resourceId)
+            val idx = ids.indexOf(ref.resourceId)
             setSelection(if (idx >= 0) idx else 0)
             onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(
                     parent: AdapterView<*>?, view: View?, position: Int, id: Long
                 ) {
-                    val newId = sortedIds.getOrNull(position) ?: return
+                    val newId = ids.getOrNull(position) ?: return
                     if (ref.resourceId != newId) {
                         ref.resourceId = newId
                         view?.post { refreshAll() }

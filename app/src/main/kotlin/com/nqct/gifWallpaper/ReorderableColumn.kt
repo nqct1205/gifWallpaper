@@ -12,30 +12,13 @@ import android.widget.TextView
 
 // 可拖动排序的纵向列表。
 //
-// 【用法】
-//   val column = ReorderableColumn(context)
-//   column.setItems(
-//       items = config.resources.entries.toList(),
-//       scrollView = 外层 ScrollView,
-//       itemBuilder = { item, index, handle ->
-//           // 构建 item 视图，把 handle 放到合适位置
-//           // 返回的 View 会被加入 column
-//       },
-//       onReorder = { from, to -> ... }
-//   )
+// 【边界限制（本轮新增）】
+//   - 被拖项在视觉上不能超出第一个/最后一个 item 的中心位置。
+//   - 拖到顶端时向上不再移动，拖到底端时向下不再移动。
+//   - 自动滚动到 ScrollView 顶/底后自动停止，不再无限累积偏移。
 //
-// 【交互】
-//   - 按住 handle（☰）开始拖动，被拖项跟随手指。
-//   - 拖动到其他项中心越过时，其他项平滑"让开"（translationY 动画）。
-//   - 拖到屏幕上下边缘时自动滚动。
-//   - 松手后立即回调 onReorder(fromIndex, toIndex)，由调用方重建页面。
-//
-// 【视觉】
-//   - 被拖项：elevation 16、放大 1.03 倍、alpha 0.95，视觉上"浮起"。
-//   - 让开项：translationY 平滑偏移。
-//
-// 【限制】拖动过程中列表本身不滚动（自动滚动由本类处理边缘触发）。
-// 项目通常 ≤12 项，一屏可容纳，无影响。
+// 【P1-2 修复】itemTops/itemHeights 在 startDrag 时重新采集。
+// 【P1-3 修复】自动滚动累积偏移补偿进 dy，被拖项始终跟手。
 class ReorderableColumn @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null
@@ -56,6 +39,7 @@ class ReorderableColumn @JvmOverloads constructor(
     private var currentTargetIndex = -1
     private var dragStartRawY = 0f
     private var lastRawY = 0f
+    private var autoScrollOffset = 0f
 
     // 自动滚动
     private var autoScrollDirection = 0
@@ -64,8 +48,15 @@ class ReorderableColumn @JvmOverloads constructor(
             if (dragIndex < 0 || autoScrollDirection == 0) return
             val sv = scrollView ?: return
             val step = (6 * resources.displayMetrics.density).toInt().coerceAtLeast(2)
+            val oldScrollY = sv.scrollY
             sv.scrollBy(0, autoScrollDirection * step)
-            // 滚动后手指在屏幕位置不变，但内容位置变了，重新计算目标索引
+            val actualDelta = sv.scrollY - oldScrollY
+            // ScrollView 已到顶/底，实际滚动量为 0，停止自动滚动
+            if (actualDelta == 0) {
+                autoScrollDirection = 0
+                return
+            }
+            autoScrollOffset += actualDelta
             updateDrag(lastRawY)
             postDelayed(this, 16)
         }
@@ -73,10 +64,6 @@ class ReorderableColumn @JvmOverloads constructor(
 
     // ==================== 公共 API ====================
 
-    // 绑定数据并重建所有 item。
-    //
-    // itemBuilder 接收 (item, index, handleView)，
-    // 由 itemBuilder 决定把 handleView 加到 item 的哪个位置。
     fun <T> setItems(
         items: List<T>,
         scrollView: ScrollView,
@@ -96,20 +83,30 @@ class ReorderableColumn @JvmOverloads constructor(
             val view = itemBuilder(item, index, handle)
             views.add(view)
             addView(view, LayoutParams(
-                    LayoutParams.MATCH_PARENT,
-                    LayoutParams.WRAP_CONTENT
+                LayoutParams.MATCH_PARENT,
+                LayoutParams.WRAP_CONTENT
             ))
         }
 
         itemViews = views
 
-        // 等布局完成后再绑定触摸和记录高度
         post {
             if (itemViews.isEmpty()) return@post
-            itemTops = IntArray(itemViews.size) { itemViews[it].top }
-            itemHeights = IntArray(itemViews.size) { itemViews[it].height }
+            recalcItemBounds()
             handles.forEachIndexed { i, h -> attachHandleTouch(h, i) }
         }
+    }
+
+    // ==================== 尺寸采集 ====================
+
+    private fun recalcItemBounds(): Boolean {
+        if (itemViews.isEmpty()) return false
+        val tops = IntArray(itemViews.size) { itemViews[it].top }
+        val heights = IntArray(itemViews.size) { itemViews[it].height }
+        if (heights.all { it <= 0 }) return false
+        itemTops = tops
+        itemHeights = heights
+        return true
     }
 
     // ==================== Handle 视图 ====================
@@ -130,11 +127,6 @@ class ReorderableColumn @JvmOverloads constructor(
         handle.setOnTouchListener { _, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    // 关键：按下 handle 时阻止外层 ScrollView 拦截触摸。
-                    // 否则 ScrollView 在 MOVE 超过 touch slop 后会夺走事件，
-                    // handle 只能收到 CANCEL，拖动流程被掐断。
-                    // requestDisallowInterceptTouchEvent 会向上传递到所有祖先，
-                    // 因此调用一次即可让整条链上的 ScrollView 都不拦截。
                     handle.parent?.requestDisallowInterceptTouchEvent(true)
                     startDrag(index, event.rawY)
                     true
@@ -146,7 +138,6 @@ class ReorderableColumn @JvmOverloads constructor(
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    // 恢复拦截：后续普通触摸仍可正常滚动页面
                     handle.parent?.requestDisallowInterceptTouchEvent(false)
                     if (dragIndex == index) {
                         finishDrag()
@@ -160,12 +151,13 @@ class ReorderableColumn @JvmOverloads constructor(
 
     private fun startDrag(index: Int, rawY: Float) {
         if (index !in itemViews.indices) return
+        if (!recalcItemBounds()) return
         dragIndex = index
         currentTargetIndex = index
         dragStartRawY = rawY
         lastRawY = rawY
+        autoScrollOffset = 0f
 
-        // 视觉提升
         itemViews[index].apply {
             elevation = 16f * resources.displayMetrics.density
             scaleX = 1.03f
@@ -174,32 +166,38 @@ class ReorderableColumn @JvmOverloads constructor(
         }
     }
 
+    // 计算 dy 上下边界：被拖项中心不能越出第一个/最后一个 item 的中心。
+    private fun computeDyBounds(): Pair<Float, Float> {
+        if (dragIndex !in itemViews.indices) return -Float.MAX_VALUE to Float.MAX_VALUE
+        val dragCenter = itemTops[dragIndex] + itemHeights[dragIndex] / 2f
+        val topCenter = itemTops[0] + itemHeights[0] / 2f
+        val last = itemViews.size - 1
+        val bottomCenter = itemTops[last] + itemHeights[last] / 2f
+        return (topCenter - dragCenter) to (bottomCenter - dragCenter)
+    }
+
     private fun updateDrag(rawY: Float) {
         if (dragIndex < 0) return
         lastRawY = rawY
 
-        // 1. 被拖项跟随手指
-        val dy = rawY - dragStartRawY
+        val rawDy = rawY - dragStartRawY + autoScrollOffset
+        val (minDy, maxDy) = computeDyBounds()
+        // 边界限制：到顶/到底后不再移动
+        val dy = rawDy.coerceIn(minDy, maxDy)
         itemViews[dragIndex].translationY = dy
 
-        // 2. 计算被拖项中心（相对于 ReorderableColumn）
-        val draggedCenterY = itemTops[dragIndex] + itemHeights[dragIndex] / 2f + dy
+        val dragCenter = itemTops[dragIndex] + itemHeights[dragIndex] / 2f
+        val draggedCenterY = dragCenter + dy
 
-        // 3. 计算目标索引
         val newTarget = calculateTargetIndex(draggedCenterY)
         if (newTarget != currentTargetIndex) {
             currentTargetIndex = newTarget
             updateLayoutHints(newTarget)
         }
 
-        // 4. 自动滚动
-        updateAutoScroll(rawY)
+        updateAutoScroll(rawY, dy, minDy, maxDy)
     }
 
-    // 目标索引计算：
-    //   被拖项中心越过某 item 的原始中心时触发交换。
-    //   向上拖：找到第一个"被拖项中心 < item 原始中心"的 item，返回其 index。
-    //   向下拖：找到最后一个"被拖项中心 > item 原始中心"的 item，返回其 index。
     private fun calculateTargetIndex(draggedCenterY: Float): Int {
         val n = itemViews.size
         if (n <= 1) return dragIndex
@@ -217,10 +215,8 @@ class ReorderableColumn @JvmOverloads constructor(
         return target
     }
 
-    // 让开动画：被拖项跨过的所有项平移一个"被拖项高度"
     private fun updateLayoutHints(targetIndex: Int) {
         if (targetIndex == dragIndex) {
-            // 恢复所有非拖动项
             itemViews.forEachIndexed { i, v ->
                 if (i != dragIndex) {
                     v.animate().translationY(0f).setDuration(150).start()
@@ -244,8 +240,8 @@ class ReorderableColumn @JvmOverloads constructor(
         }
     }
 
-    // 自动滚动：拖到屏幕上下边缘 80dp 内触发
-    private fun updateAutoScroll(rawY: Float) {
+    // 自动滚动。到边界（dy 已顶到 min/max）时不滚动。
+    private fun updateAutoScroll(rawY: Float, dy: Float, minDy: Float, maxDy: Float) {
         val screenHeight = resources.displayMetrics.heightPixels
         val edgePx = (80 * resources.displayMetrics.density).toInt()
 
@@ -255,10 +251,17 @@ class ReorderableColumn @JvmOverloads constructor(
             else -> 0
         }
 
-        if (newDir != autoScrollDirection) {
-            autoScrollDirection = newDir
+        // 到达边界时不再滚动
+        val effectiveDir = when {
+            newDir == -1 && dy <= minDy -> 0
+            newDir == 1 && dy >= maxDy -> 0
+            else -> newDir
+        }
+
+        if (effectiveDir != autoScrollDirection) {
+            autoScrollDirection = effectiveDir
             removeCallbacks(autoScrollRunnable)
-            if (newDir != 0) {
+            if (effectiveDir != 0) {
                 postDelayed(autoScrollRunnable, 16)
             }
         }
@@ -270,13 +273,12 @@ class ReorderableColumn @JvmOverloads constructor(
         dragIndex = -1
         currentTargetIndex = -1
         autoScrollDirection = 0
+        autoScrollOffset = 0f
         removeCallbacks(autoScrollRunnable)
 
         if (src != dst && src >= 0 && dst >= 0) {
-            // 重建页面会重置所有视觉，无需手动恢复动画
             onReorderCallback?.invoke(src, dst)
         } else {
-            // 未发生变化：恢复视觉
             itemViews.forEachIndexed { i, v ->
                 v.animate().translationY(0f).scaleX(1f).scaleY(1f).alpha(1f).setDuration(150).start()
                 if (i == src) v.elevation = 0f

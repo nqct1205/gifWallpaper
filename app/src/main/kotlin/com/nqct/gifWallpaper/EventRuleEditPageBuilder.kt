@@ -17,6 +17,12 @@ import android.widget.Spinner
 import android.widget.TextView
 
 // 事件规则编辑页。
+//
+// 【新建模式】ruleId 为 null 时创建**临时** EventRule，不加入 config.eventRules。
+// 点"保存并返回"才正式加入 config；点"取消"/返回/系统返回时什么都不做（丢弃）。
+//
+// 【编辑模式】rule 就是 config 里那条规则的引用，字段修改会直接 mutate。
+// 点"保存并返回"由 MainActivity 持久化；点"取消"/返回/系统返回时由 MainActivity loadConfig 丢弃。
 class EventRuleEditPageBuilder(
     private val activity: Activity,
     private val config: ProjectConfig,
@@ -40,12 +46,16 @@ class EventRuleEditPageBuilder(
     )
 
     fun build(): View {
-        val rule: EventRule = if (ruleId != null) {
+        val isNew = ruleId == null
+
+        // 新建模式：创建临时 rule，不加入 config
+        // 编辑模式：从 config 里取
+        val rule: EventRule = if (!isNew) {
             config.eventRules.firstOrNull { it.id == ruleId } ?: return View(activity)
         } else {
             var idx = 1
             while (config.eventRules.any { it.id == "ev_$idx" }) idx++
-            EventRule(id = "ev_$idx").also { config.eventRules.add(it) }
+            EventRule(id = "ev_$idx")
         }
 
         val root = LinearLayout(activity).apply {
@@ -63,7 +73,7 @@ class EventRuleEditPageBuilder(
             setOnClickListener { callbacks.onBack() }
         })
         topBar.addView(TextView(activity).apply {
-            text = if (ruleId == null) "新建事件规则" else "编辑事件规则"
+            text = if (isNew) "新建事件规则" else "编辑事件规则"
             textSize = 18f
             setTypeface(null, Typeface.BOLD)
             setPadding(20, 0, 0, 0)
@@ -130,7 +140,6 @@ class EventRuleEditPageBuilder(
                 setTextColor(Color.RED)
             })
         } else {
-            // 顺序跟随用户排序
             val stateIds = config.states.keys.toList()
             for (sid in stateIds) {
                 root.addView(CheckBox(activity).apply {
@@ -154,7 +163,6 @@ class EventRuleEditPageBuilder(
             setPadding(0, 20, 0, 5)
         })
 
-        // 顺序跟随用户排序
         val targetIds = config.states.keys.toList()
         if (targetIds.isEmpty()) {
             root.addView(TextView(activity).apply {
@@ -187,7 +195,38 @@ class EventRuleEditPageBuilder(
             root.addView(spinner)
         }
 
-        root.addView(buildBottomBar(), matchWrap(top = 30))
+        // 底部按钮：新建模式"取消"，编辑模式"删除规则"
+        val btnRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 20, 0, 0)
+        }
+        btnRow.addView(Button(activity).apply {
+            text = "保存并返回"
+            setBackgroundColor(Color.parseColor("#4CAF50"))
+            setTextColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener {
+                // 新建模式：保存时正式加入 config
+                if (isNew && config.eventRules.none { it.id == rule.id }) {
+                    config.eventRules.add(rule)
+                }
+                callbacks.onSaved()
+            }
+        })
+        btnRow.addView(Button(activity).apply {
+            text = if (isNew) "取消" else "删除规则"
+            setTextColor(Color.RED)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener {
+                if (isNew) {
+                    // 新建模式：取消，直接返回
+                    callbacks.onBack()
+                } else {
+                    callbacks.onDelete()
+                }
+            }
+        })
+        root.addView(btnRow)
 
         return root
     }
@@ -313,30 +352,4 @@ class EventRuleEditPageBuilder(
             setPadding(0, 5, 0, 0)
         })
     }
-
-    private fun buildBottomBar(): View {
-        val row = LinearLayout(activity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, 20, 0, 0)
-        }
-        row.addView(Button(activity).apply {
-            text = "保存并返回"
-            setBackgroundColor(Color.parseColor("#4CAF50"))
-            setTextColor(Color.WHITE)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener { callbacks.onSaved() }
-        })
-        row.addView(Button(activity).apply {
-            text = "删除规则"
-            setTextColor(Color.RED)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener { callbacks.onDelete() }
-        })
-        return row
-    }
-
-    private fun matchWrap(top: Int = 0) = LinearLayout.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT,
-        ViewGroup.LayoutParams.WRAP_CONTENT
-    ).apply { setMargins(0, top, 0, 0) }
 }

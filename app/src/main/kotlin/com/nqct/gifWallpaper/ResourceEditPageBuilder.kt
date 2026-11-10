@@ -16,14 +16,13 @@ import android.widget.RadioGroup
 import android.widget.TextView
 import android.widget.Toast
 
-// 资源编辑页（当前仅支持播放速度配置）。
+// 资源编辑页（播放速度配置）。
 //
-// 【存储】只存 customValue 一个字段：
-//   FRAME_INTERVAL 模式时 = 帧间隔（ms），TOTAL_DURATION 模式时 = 总时长（ms）。
-// 另一个字段只在 UI 上显示，由 customValue 和 frameCount 算出来，不存储。
-//
-// 【联动】切换模式时保留用户已填过的值（customValue），另一个字段自动重算。
-// 在当前模式下编辑"主字段"时，另一个"副字段"实时重算。
+// 【P2-10 修复】不再进页面就 clamp 旧数据：
+//   - 原实现 refreshByMode 里对 customValue 执行 coerceIn(8,500)/(100,60000)，
+//     用户打开一个存有非法值的旧数据页面时，值会被静默修改。
+//   - 现实现：进页面显示原值；超出范围时旁边标注"⚠ 超出范围，保存时将被修正"；
+//     用户主动编辑主字段时才 clamp；保存时 clamp 并 Toast 提示。
 class ResourceEditPageBuilder(
     private val activity: Activity,
     private val config: ProjectConfig,
@@ -132,11 +131,12 @@ class ResourceEditPageBuilder(
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         rowFrame.addView(etFrame)
-        rowFrame.addView(TextView(activity).apply {
+        val tvFrameRange = TextView(activity).apply {
             text = " ms（8~500）"
             textSize = 13f
             setTextColor(Color.GRAY)
-        })
+        }
+        rowFrame.addView(tvFrameRange)
         root.addView(rowFrame)
 
         // 总时长行
@@ -155,18 +155,17 @@ class ResourceEditPageBuilder(
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         rowTotal.addView(etTotal)
-        rowTotal.addView(TextView(activity).apply {
+        val tvTotalRange = TextView(activity).apply {
             text = " ms（100~60000）"
             textSize = 13f
             setTextColor(Color.GRAY)
-        })
+        }
+        rowTotal.addView(tvTotalRange)
         root.addView(rowTotal)
 
         var syncing = false
 
-        // 根据当前模式刷新两个输入框的显示值与可编辑状态。
-        // 主字段：当前模式对应的那个（FRAME_INTERVAL 时帧间隔，TOTAL_DURATION 时总时长）。
-        // 副字段：由主字段 + 帧数推算，只读。
+        // P2-10：不再 clamp，只显示。超出范围时旁注提示。
         fun refreshByMode() {
             syncing = true
             when (item.playbackMode) {
@@ -175,27 +174,50 @@ class ResourceEditPageBuilder(
                     etTotal.isEnabled = false
                     etFrame.setText(origAvg.toString())
                     etTotal.setText(origTotal.toString())
+                    tvFrameRange.text = " ms（8~500）"
+                    tvFrameRange.setTextColor(Color.GRAY)
+                    tvTotalRange.text = " ms（100~60000）"
+                    tvTotalRange.setTextColor(Color.GRAY)
                 }
                 ResourcePlaybackMode.FRAME_INTERVAL -> {
                     etFrame.isEnabled = true
                     etTotal.isEnabled = false
-                    if (item.customValue <= 0) item.customValue = origAvg.coerceIn(8, 500)
-                    item.customValue = item.customValue.coerceIn(8, 500)
-                    etFrame.setText(item.customValue.toString())
-                    etTotal.setText((item.customValue * frameCount).toString())
+                    val displayValue = if (item.customValue > 0) item.customValue else origAvg
+                    etFrame.setText(displayValue.toString())
+                    val totalShown = displayValue * frameCount
+                    etTotal.setText(totalShown.toString())
+                    if (displayValue !in 8..500) {
+                        tvFrameRange.text = " ⚠ 超出范围（8~500），保存时将被修正"
+                        tvFrameRange.setTextColor(Color.RED)
+                    } else {
+                        tvFrameRange.text = " ms（8~500）"
+                        tvFrameRange.setTextColor(Color.GRAY)
+                    }
+                    tvTotalRange.text = " ms（自动）"
+                    tvTotalRange.setTextColor(Color.GRAY)
                 }
                 ResourcePlaybackMode.TOTAL_DURATION -> {
                     etFrame.isEnabled = false
                     etTotal.isEnabled = true
-                    if (item.customValue <= 0) item.customValue = origTotal.coerceIn(100, 60000)
-                    item.customValue = item.customValue.coerceIn(100, 60000)
-                    etTotal.setText(item.customValue.toString())
-                    etFrame.setText((item.customValue / frameCount.coerceAtLeast(1)).coerceAtLeast(1).toString())
+                    val displayValue = if (item.customValue > 0) item.customValue else origTotal
+                    etTotal.setText(displayValue.toString())
+                    val frameShown = (displayValue / frameCount.coerceAtLeast(1)).coerceAtLeast(1)
+                    etFrame.setText(frameShown.toString())
+                    if (displayValue !in 100..60000) {
+                        tvTotalRange.text = " ⚠ 超出范围（100~60000），保存时将被修正"
+                        tvTotalRange.setTextColor(Color.RED)
+                    } else {
+                        tvTotalRange.text = " ms（100~60000）"
+                        tvTotalRange.setTextColor(Color.GRAY)
+                    }
+                    tvFrameRange.text = " ms（自动）"
+                    tvFrameRange.setTextColor(Color.GRAY)
                 }
             }
             syncing = false
         }
 
+        // 用户编辑主字段时才 clamp
         etFrame.addTextChangedListener(object : SimpleTextWatcher() {
             override fun afterTextChanged(s: Editable?) {
                 if (syncing || item.playbackMode != ResourcePlaybackMode.FRAME_INTERVAL) return
@@ -203,6 +225,8 @@ class ResourceEditPageBuilder(
                 item.customValue = v
                 syncing = true
                 etTotal.setText((v * frameCount).toString())
+                tvFrameRange.text = " ms（8~500）"
+                tvFrameRange.setTextColor(Color.GRAY)
                 syncing = false
             }
         })
@@ -214,6 +238,8 @@ class ResourceEditPageBuilder(
                 item.customValue = v
                 syncing = true
                 etFrame.setText((v / frameCount.coerceAtLeast(1)).coerceAtLeast(1).toString())
+                tvTotalRange.text = " ms（100~60000）"
+                tvTotalRange.setTextColor(Color.GRAY)
                 syncing = false
             }
         })
@@ -252,9 +278,40 @@ class ResourceEditPageBuilder(
             setTextColor(Color.WHITE)
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             setOnClickListener {
+                // 保存时 clamp 并提示
+                var clamped = false
+                when (item.playbackMode) {
+                    ResourcePlaybackMode.FRAME_INTERVAL -> {
+                        if (item.customValue !in 8..500) {
+                            val old = item.customValue
+                            item.customValue = old.coerceIn(8, 500)
+                            clamped = true
+                            Toast.makeText(
+                                activity,
+                                "帧间隔 $old ms 超出范围，已修正为 ${item.customValue}ms",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                    ResourcePlaybackMode.TOTAL_DURATION -> {
+                        if (item.customValue !in 100..60000) {
+                            val old = item.customValue
+                            item.customValue = old.coerceIn(100, 60000)
+                            clamped = true
+                            Toast.makeText(
+                                activity,
+                                "总时长 $old ms 超出范围，已修正为 ${item.customValue}ms",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                    else -> {}
+                }
                 val speedDesc = item.speedDescription()
-                LogBuffer.i("资源速度修改: $resourceId -> $speedDesc, factor=${item.speedFactor()}")
-                Toast.makeText(activity, "已保存: $speedDesc", Toast.LENGTH_SHORT).show()
+                LogBuffer.i("资源速度修改: $resourceId -> $speedDesc, factor=${item.speedFactor()}, clamped=$clamped")
+                if (!clamped) {
+                    Toast.makeText(activity, "已保存: $speedDesc", Toast.LENGTH_SHORT).show()
+                }
                 callbacks.onSaved()
             }
         })

@@ -4,13 +4,6 @@ package com.nqct.gifWallpaper
 
 // ==================== 资源层 ====================
 
-// 资源播放模式。
-//   NATIVE：GIF 原始速度。
-//   FRAME_INTERVAL：customValue 是帧间隔（毫秒）。
-//   TOTAL_DURATION：customValue 是总时长（毫秒）。
-//
-// 【存储约定】只存一个 customValue，另一个由 frameCount 推算。
-// 保证 targetFrameIntervalMs × frameCount == targetTotalDurationMs，消除双字段不一致的可能。
 enum class ResourcePlaybackMode { NATIVE, FRAME_INTERVAL, TOTAL_DURATION }
 
 data class ResourceItem(
@@ -18,20 +11,16 @@ data class ResourceItem(
     val fileName: String,
     val info: GifInfo?,
     var playbackMode: ResourcePlaybackMode = ResourcePlaybackMode.NATIVE,
-    // 按 playbackMode 决定语义：FRAME_INTERVAL 时是帧间隔，TOTAL_DURATION 时是总时长。NATIVE 时忽略。
     var customValue: Int = 0
 ) {
-    // 帧数（优先 GifInfo，无效时返回 0）
     private fun frames(): Int = info?.frameCount?.coerceAtLeast(1) ?: 0
 
-    // 原始平均帧时长（毫秒）
     private fun origAvgMs(): Long {
         val inf = info ?: return 0L
         val n = inf.frameCount.coerceAtLeast(1)
         return (inf.totalDelayMs / n).toLong().coerceAtLeast(1L)
     }
 
-    // 目标帧间隔（每帧多久）。NATIVE 用原始平均；自定义按模式取。
     fun targetFrameIntervalMs(): Long {
         val inf = info ?: return 33L
         val n = inf.frameCount.coerceAtLeast(1)
@@ -46,7 +35,6 @@ data class ResourceItem(
         }
     }
 
-    // 目标总时长（一圈多久）。与 targetFrameIntervalMs 严格满足 × frameCount 的关系。
     fun targetTotalDurationMs(): Long {
         val inf = info ?: return 0L
         val n = inf.frameCount.coerceAtLeast(1)
@@ -60,7 +48,6 @@ data class ResourceItem(
         }
     }
 
-    // 速度因子（GifDrawable.setSpeed 用）。= 原始平均帧时长 / 目标帧间隔。
     fun speedFactor(): Float {
         val inf = info ?: return 1f
         val origAvg = origAvgMs().toFloat()
@@ -70,7 +57,6 @@ data class ResourceItem(
         return (origAvg / target).coerceIn(0.1f, 10f)
     }
 
-    // 用户可读的速度描述。
     fun speedDescription(): String {
         val inf = info ?: return "原生速度"
         val n = inf.frameCount.coerceAtLeast(1)
@@ -125,16 +111,27 @@ data class AnimationResourceRef(
     var scaleMode: ScaleMode = ScaleMode.PERCENT,
     var scaleValue: Float = 100f,
     var offsetX: Float = 0f,
-    var offsetY: Float = 0f
+    var offsetY: Float = 0f,
+    var startDelayMs: Int = 0
 )
 
 // ==================== 动画层 ====================
 
+// 动画项。
+//
+// 【endTimeMs】多资源时的整圈时长（毫秒）。语义：
+//   0              -> 自动 = max(每个资源.startDelayMs + 自身时长)
+//   >0 且资源数 >1 -> 用户自定义整圈时长
+//   单资源时忽略（无论填什么值都按资源自身时长）
+//
+// 用户自定义整圈时长时，若某个资源在 endTimeMs 之后仍在播，会被强制截断；
+// 若所有资源都早于 endTimeMs 播完，中间的空窗期持续显示背景色。
 data class AnimationItem(
     var id: String = "",
     var name: String = "",
     var backgroundColor: String = "",
-    var resources: MutableList<AnimationResourceRef> = mutableListOf()
+    var resources: MutableList<AnimationResourceRef> = mutableListOf(),
+    var endTimeMs: Int = 0
 )
 
 // ==================== 状态与转移规则 ====================

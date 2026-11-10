@@ -23,11 +23,21 @@ import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
 // 应用入口 Activity。
+//
+// 【编辑页返回语义】
+//   进入编辑页时记录 config 的 JSON 快照（editSnapshot）。
+//   返回时比较当前 config 的 JSON 与快照：
+//     - 相同（未修改）→ 直接 loadConfig + showPage(returnTo)，不弹窗。
+//     - 不同（已修改）→ 弹"保存 / 不保存 / 取消"对话框。
+//   覆盖 ResourceEdit / AnimationEdit / StateEdit / EventRuleEdit 四个编辑页。
 class MainActivity : Activity() {
 
     private var config = ProjectConfig()
     private var lastWarning: String? = null
     private var currentPage: Page = Page.Main
+
+    // 进入编辑页时的 JSON 快照。null 表示当前不在编辑页。
+    private var editSnapshot: String? = null
 
     private sealed class Page {
         object Main : Page()
@@ -100,29 +110,62 @@ class MainActivity : Activity() {
         }
     }
 
+    // ==================== 返回导航 ====================
+
     private fun handleBackNavigation() {
         val cur = currentPage
-        val back: Page? = when (cur) {
-            is Page.Main -> null
-            is Page.ResourceEdit -> Page.ResourceList
-            is Page.StateEdit -> cur.returnTo
-            is Page.EventRuleEdit -> cur.returnTo
-            is Page.LogExport -> Page.Main
-            else -> Page.Main
+        when (cur) {
+            is Page.Main -> exitActivity()
+            is Page.ResourceEdit -> handleEditBack(Page.ResourceList)
+            is Page.AnimationEdit -> handleEditBack(Page.AnimationList)
+            is Page.StateEdit -> handleEditBack(cur.returnTo)
+            is Page.EventRuleEdit -> handleEditBack(cur.returnTo)
+            is Page.LogExport -> showPage(Page.Main)
+            else -> showPage(Page.Main)
         }
-        if (back == null) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                finish()
-            } else {
-                @Suppress("DEPRECATION")
-                super.onBackPressed()
-            }
+    }
+
+    private fun exitActivity() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            finish()
         } else {
-            if (cur is Page.StateEdit || cur is Page.EventRuleEdit) {
-                saveConfig()
-            }
-            showPage(back)
+            @Suppress("DEPRECATION")
+            super.onBackPressed()
         }
+    }
+
+    // 编辑页返回统一处理：先比较是否修改，未修改直接返回，修改了才弹窗。
+    private fun handleEditBack(returnTo: Page) {
+        val snapshot = editSnapshot
+        val currentJson = try {
+            ProjectConfigStore.toJsonString(config)
+        } catch (e: Exception) {
+            null
+        }
+
+        // 未修改（或无法比对）→ 直接返回
+        if (snapshot != null && currentJson != null && snapshot == currentJson) {
+            editSnapshot = null
+            loadConfig()
+            showPage(returnTo)
+            return
+        }
+
+        // 已修改 → 三选一
+        AlertDialog.Builder(this)
+            .setTitle("未保存的修改")
+            .setMessage("是否保存当前修改？")
+            .setPositiveButton("保存") { _, _ ->
+                editSnapshot = null
+                if (saveConfig()) showPage(returnTo)
+            }
+            .setNeutralButton("不保存") { _, _ ->
+                editSnapshot = null
+                loadConfig()
+                showPage(returnTo)
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     // ==================== 配置加载 / 保存 ====================
@@ -141,12 +184,25 @@ class MainActivity : Activity() {
     }
 
     private fun saveConfig(): Boolean {
+        for (anim in config.animations.values) {
+            if (anim.resources.size <= 1) {
+                anim.resources.forEach { if (it.startDelayMs != 0) it.startDelayMs = 0 }
+                if (anim.endTimeMs != 0) anim.endTimeMs = 0
+            }
+        }
+
         val ok = ProjectConfigStore.save(this, config)
         if (!ok) {
             Toast.makeText(this, "保存失败", Toast.LENGTH_SHORT).show()
             LogBuffer.e("配置保存失败")
+            return false
         }
-        return ok
+
+        val issues = config.validate()
+        if (issues.isNotEmpty()) {
+            issues.forEach { LogBuffer.w("配置校验: $it") }
+        }
+        return true
     }
 
     // ==================== 页面路由 ====================
@@ -154,7 +210,6 @@ class MainActivity : Activity() {
     private fun showPage(page: Page) {
         currentPage = page
 
-        // 状态图：全屏，不包 ScrollView
         if (page is Page.StateGraph) {
             setContentView(buildStateGraphPage())
             return
@@ -178,6 +233,15 @@ class MainActivity : Activity() {
         setContentView(scrollView)
     }
 
+    // 进入编辑页前记录快照。若已有快照（理论上不会，因为每次返回都会清），先清。
+    private fun captureEditSnapshot() {
+        editSnapshot = try {
+            ProjectConfigStore.toJsonString(config)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     private fun buildMainPage(): android.view.View = MainPageBuilder(
         activity = this,
         config = config,
@@ -193,7 +257,7 @@ class MainActivity : Activity() {
             override fun onRestoreSystemWallpaper() { confirmRestoreSystemWallpaper() }
             override fun onExportJson() { startExportJson() }
             override fun onExportZip() { startExportZip() }
-            override fun onImportJson() { confirmImport("导入 JSON") { startImportJson() } }
+            override fun onImportJson() { startImportJson() }
             override fun onImportZip() { confirmImport("导入压缩包") { startImportZip() } }
             override fun onExportLog() { showPage(Page.LogExport) }
         }
@@ -222,6 +286,7 @@ class MainActivity : Activity() {
             override fun onImportGif() { selectGif() }
             override fun onDeleteResource(resourceId: String) { deleteResource(resourceId) }
             override fun onEditResource(resourceId: String) {
+                captureEditSnapshot()
                 showPage(Page.ResourceEdit(resourceId))
             }
             override fun onReorderResources(fromIndex: Int, toIndex: Int) {
@@ -238,10 +303,10 @@ class MainActivity : Activity() {
         config = config,
         resourceId = resourceId,
         callbacks = object : ResourceEditPageBuilder.Callbacks {
-            override fun onBack() { showPage(Page.ResourceList) }
+            override fun onBack() { handleEditBack(Page.ResourceList) }
             override fun onSaved() {
-                saveConfig()
-                showPage(Page.ResourceList)
+                editSnapshot = null
+                if (saveConfig()) showPage(Page.ResourceList)
             }
         }
     ).build()
@@ -252,7 +317,10 @@ class MainActivity : Activity() {
         callbacks = object : AnimationListPageBuilder.Callbacks {
             override fun onBack() { showPage(Page.Main) }
             override fun onCreateAnimation() { createNewAnimation() }
-            override fun onEditAnimation(animationId: String) { showPage(Page.AnimationEdit(animationId)) }
+            override fun onEditAnimation(animationId: String) {
+                captureEditSnapshot()
+                showPage(Page.AnimationEdit(animationId))
+            }
             override fun onDeleteAnimation(animationId: String) { deleteAnimation(animationId) }
             override fun onReorderAnimations(fromIndex: Int, toIndex: Int) {
                 config.reorderAnimations(fromIndex, toIndex)
@@ -268,11 +336,9 @@ class MainActivity : Activity() {
         config = config,
         animationId = animationId,
         callbacks = object : AnimationEditPageBuilder.Callbacks {
-            override fun onBack() {
-                saveConfig()
-                showPage(Page.AnimationList)
-            }
+            override fun onBack() { handleEditBack(Page.AnimationList) }
             override fun onSaved() {
+                editSnapshot = null
                 if (saveConfig()) showPage(Page.AnimationList)
             }
             override fun onDelete() { deleteAnimation(animationId) }
@@ -285,7 +351,10 @@ class MainActivity : Activity() {
         callbacks = object : StateListPageBuilder.Callbacks {
             override fun onBack() { showPage(Page.Main) }
             override fun onCreateState() { createNewState() }
-            override fun onEditState(stateId: String) { showPage(Page.StateEdit(stateId)) }
+            override fun onEditState(stateId: String) {
+                captureEditSnapshot()
+                showPage(Page.StateEdit(stateId))
+            }
             override fun onDeleteState(stateId: String) { deleteState(stateId) }
             override fun onSetDefault(stateId: String) {
                 config.defaultStateId = stateId
@@ -306,11 +375,9 @@ class MainActivity : Activity() {
         config = config,
         stateId = page.stateId,
         callbacks = object : StateEditPageBuilder.Callbacks {
-            override fun onBack() {
-                saveConfig()
-                showPage(page.returnTo)
-            }
+            override fun onBack() { handleEditBack(page.returnTo) }
             override fun onSaved() {
+                editSnapshot = null
                 if (saveConfig()) showPage(page.returnTo)
             }
             override fun onDelete() { deleteState(page.stateId) }
@@ -322,8 +389,14 @@ class MainActivity : Activity() {
         config = config,
         callbacks = object : EventRuleListPageBuilder.Callbacks {
             override fun onBack() { showPage(Page.Main) }
-            override fun onCreateRule() { showPage(Page.EventRuleEdit(null)) }
-            override fun onEditRule(ruleId: String) { showPage(Page.EventRuleEdit(ruleId)) }
+            override fun onCreateRule() {
+                captureEditSnapshot()
+                showPage(Page.EventRuleEdit(null))
+            }
+            override fun onEditRule(ruleId: String) {
+                captureEditSnapshot()
+                showPage(Page.EventRuleEdit(ruleId))
+            }
             override fun onDeleteRule(ruleId: String) { deleteEventRule(ruleId) }
         }
     ).build()
@@ -333,11 +406,9 @@ class MainActivity : Activity() {
         config = config,
         ruleId = page.ruleId,
         callbacks = object : EventRuleEditPageBuilder.Callbacks {
-            override fun onBack() {
-                saveConfig()
-                showPage(page.returnTo)
-            }
+            override fun onBack() { handleEditBack(page.returnTo) }
             override fun onSaved() {
+                editSnapshot = null
                 if (saveConfig()) showPage(page.returnTo)
             }
             override fun onDelete() {
@@ -352,9 +423,11 @@ class MainActivity : Activity() {
         callbacks = object : StateGraphPageBuilder.Callbacks {
             override fun onBack() { showPage(Page.Main) }
             override fun onNodeDoubleTap(stateId: String) {
+                captureEditSnapshot()
                 showPage(Page.StateEdit(stateId, returnTo = Page.StateGraph))
             }
             override fun onEventDoubleTap(ruleId: String) {
+                captureEditSnapshot()
                 showPage(Page.EventRuleEdit(ruleId, returnTo = Page.StateGraph))
             }
         }
@@ -482,20 +555,106 @@ class MainActivity : Activity() {
         startActivityForResult(intent, REQ_IMPORT_ZIP)
     }
 
+    // JSON 导入预校验 + 变更摘要
     private fun importJsonFrom(uri: Uri) {
+        val text = try {
+            contentResolver.openInputStream(uri)?.use {
+                it.readBytes().toString(Charsets.UTF_8)
+            }
+        } catch (e: Exception) {
+            Toast.makeText(this, "读取失败: ${e.message}", Toast.LENGTH_SHORT).show()
+            return
+        } ?: run {
+            Toast.makeText(this, "无法读取文件", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val parsed = ProjectConfigStore.parseOnly(text)
+        if (parsed == null) {
+            Toast.makeText(this, "JSON 格式错误或内容为空", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val issues = previewImportChanges(parsed)
+        if (issues.isEmpty()) {
+            doImportJson(text)
+        } else {
+            AlertDialog.Builder(this)
+                .setTitle("导入会丢弃以下内容")
+                .setMessage(issues.joinToString("\n\n") + "\n\n是否继续导入？")
+                .setPositiveButton("继续导入") { _, _ -> doImportJson(text) }
+                .setNegativeButton("取消", null)
+                .show()
+        }
+    }
+
+    private fun previewImportChanges(parsed: ProjectConfig): List<String> {
+        val issues = mutableListOf<String>()
+        val diskResIds = try {
+            ProjectConfigStore.animDir(this).listFiles()
+                ?.filter { it.extension.lowercase() == "gif" }
+                ?.map { it.nameWithoutExtension }?.toSet() ?: emptySet()
+        } catch (e: Exception) {
+            emptySet()
+        }
+
+        val missingRes = parsed.resources.keys.filter { it !in diskResIds }
+        if (missingRes.isNotEmpty()) {
+            val preview = missingRes.take(3).joinToString("、")
+            val suffix = if (missingRes.size > 3) " 等" else ""
+            issues.add("• ${missingRes.size} 个资源文件在磁盘上不存在，将被移除: $preview$suffix")
+        }
+
+        var animRefCount = 0
+        for (anim in parsed.animations.values) {
+            animRefCount += anim.resources.count { it.resourceId !in diskResIds }
+        }
+        if (animRefCount > 0) {
+            issues.add("• $animRefCount 处动画资源引用将失效并被清理")
+        }
+
+        val badStates = parsed.states.values.filter { it.animationId !in parsed.animations.keys }
+        if (badStates.isNotEmpty()) {
+            val preview = badStates.take(3).joinToString("、") { it.id }
+            val suffix = if (badStates.size > 3) " 等" else ""
+            issues.add("• ${badStates.size} 个状态引用了不存在的动画，将被移除: $preview$suffix")
+        }
+
+        var badRules = 0
+        for (s in parsed.states.values) {
+            badRules += s.rules.count { it.targetStateId !in parsed.states.keys }
+        }
+        if (badRules > 0) {
+            issues.add("• $badRules 条转移规则的目标状态不存在，将被移除")
+        }
+
+        var badEventRules = 0
+        var badEventSources = 0
+        for (r in parsed.eventRules) {
+            if (r.targetStateId !in parsed.states.keys) badEventRules++
+            badEventSources += r.sourceStateIds.count { it !in parsed.states.keys }
+        }
+        if (badEventRules > 0) {
+            issues.add("• $badEventRules 条事件规则的目标状态不存在，将被移除")
+        }
+        if (badEventSources > 0) {
+            issues.add("• $badEventSources 个事件规则的触发状态引用将失效")
+        }
+
+        if (parsed.defaultStateId.isNotEmpty() && parsed.defaultStateId !in parsed.states.keys) {
+            issues.add("• 默认状态 ${parsed.defaultStateId} 不存在，将被自动修正")
+        }
+
+        return issues
+    }
+
+    private fun doImportJson(text: String) {
         val configFile = ProjectConfigStore.configFile(this)
         val oldText: String? = try {
             if (configFile.exists()) configFile.readText() else null
         } catch (e: Exception) { null }
 
         try {
-            val text = contentResolver.openInputStream(uri)?.use {
-                it.readBytes().toString(Charsets.UTF_8)
-            } ?: throw IllegalStateException("无法读取文件")
-
-            ProjectConfigStore.parseOnly(text)
-                ?: throw IllegalArgumentException("JSON 格式错误或内容为空")
-
             try {
                 configFile.writeText(text)
             } catch (e: Exception) {
@@ -505,6 +664,7 @@ class MainActivity : Activity() {
                 throw e
             }
 
+            editSnapshot = null
             loadConfig()
             saveConfig()
             showPage(Page.Main)
@@ -608,6 +768,7 @@ class MainActivity : Activity() {
                 throw e
             }
 
+            editSnapshot = null
             loadConfig()
             saveConfig()
             showPage(Page.Main)
@@ -726,6 +887,8 @@ class MainActivity : Activity() {
         val id = "anim_$idx"
         config.animations[id] = AnimationItem(id = id, name = "动画 $idx")
         saveConfig()
+        // 新建后进入编辑：先 saveConfig 已落盘，快照基于落盘后的 config
+        captureEditSnapshot()
         showPage(Page.AnimationEdit(id))
     }
 
@@ -760,6 +923,7 @@ class MainActivity : Activity() {
         config.states[id] = StateNode(id = id, name = "状态 $idx")
         if (config.defaultStateId.isEmpty()) config.defaultStateId = id
         saveConfig()
+        captureEditSnapshot()
         showPage(Page.StateEdit(id))
     }
 
@@ -793,7 +957,6 @@ class MainActivity : Activity() {
             Toast.makeText(this, "还没有任何状态", Toast.LENGTH_SHORT).show()
             return
         }
-        // 顺序跟随用户排序
         val ids = config.states.keys.toTypedArray()
         val displays = ids.map { formatStateDisplay(config.states[it]) }.toTypedArray()
         val currentIdx = ids.indexOf(config.defaultStateId).coerceAtLeast(0)

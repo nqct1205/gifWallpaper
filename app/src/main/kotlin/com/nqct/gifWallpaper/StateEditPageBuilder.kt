@@ -18,6 +18,12 @@ import android.widget.TextView
 import android.widget.Toast
 
 // 状态编辑页。
+//
+// 【P2-9 修复】periodMin / periodMax 联动：
+//   - 原实现：periodMin 改动后若 periodMax < periodMin 则修正 periodMax 数据，
+//     但 etMax 输入框文本未同步，导致"数据已修正、UI 显示旧值"。
+//   - 现实现：用 syncing 标志避免联动死循环；periodMin 导致 periodMax 修正时，
+//     同步回写 etMax 文本。
 class StateEditPageBuilder(
     private val activity: Activity,
     private val config: ProjectConfig,
@@ -40,7 +46,6 @@ class StateEditPageBuilder(
             setBackgroundColor(Color.parseColor("#F5F5F5"))
         }
 
-        // 顶栏
         val topBar = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -172,7 +177,6 @@ class StateEditPageBuilder(
             textSize = 14f
         })
 
-        // 顺序跟随用户排序
         val animIds = config.animations.keys.toList()
         if (animIds.isEmpty()) {
             row.addView(TextView(activity).apply {
@@ -210,38 +214,79 @@ class StateEditPageBuilder(
         return row
     }
 
+    // ==================== 周期 ====================
+
+    // P2-9：periodMin 修正 periodMax 时，同步回写 etMax 文本。
     private fun buildPeriodRow(state: StateNode): View {
         val row = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
         row.addView(TextView(activity).apply { text = "最小: "; textSize = 13f })
-        row.addView(EditText(activity).apply {
+
+        // syncing 防止两个 watcher 互相触发
+        var syncing = false
+
+        val etMin = EditText(activity).apply {
             inputType = InputType.TYPE_CLASS_NUMBER
             setText(state.periodMin.toString())
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            addTextChangedListener(object : SimpleTextWatcher() {
-                override fun afterTextChanged(s: Editable?) {
-                    state.periodMin = s?.toString()?.toIntOrNull()?.coerceAtLeast(1) ?: 1
-                    if (state.periodMax < state.periodMin) state.periodMax = state.periodMin
-                }
-            })
-        })
-        row.addView(TextView(activity).apply { text = "圈   最大: "; textSize = 13f; setPadding(10, 0, 0, 0) })
-        row.addView(EditText(activity).apply {
+        }
+        val etMax = EditText(activity).apply {
             inputType = InputType.TYPE_CLASS_NUMBER
             setText(state.periodMax.toString())
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            addTextChangedListener(object : SimpleTextWatcher() {
-                override fun afterTextChanged(s: Editable?) {
-                    val v = s?.toString()?.toIntOrNull() ?: 1
-                    state.periodMax = v.coerceAtLeast(state.periodMin)
+        }
+
+        etMin.addTextChangedListener(object : SimpleTextWatcher() {
+            override fun afterTextChanged(s: Editable?) {
+                if (syncing) return
+                syncing = true
+                try {
+                    val v = s?.toString()?.toIntOrNull()?.coerceAtLeast(1) ?: 1
+                    state.periodMin = v
+                    if (state.periodMax < state.periodMin) {
+                        state.periodMax = state.periodMin
+                        // P2-9：同步回写 etMax
+                        val maxText = state.periodMax.toString()
+                        if (etMax.text?.toString() != maxText) {
+                            etMax.setText(maxText)
+                            etMax.setSelection(maxText.length)
+                        }
+                    }
+                } finally {
+                    syncing = false
                 }
-            })
+            }
         })
+
+        etMax.addTextChangedListener(object : SimpleTextWatcher() {
+            override fun afterTextChanged(s: Editable?) {
+                if (syncing) return
+                syncing = true
+                try {
+                    val v = s?.toString()?.toIntOrNull()?.coerceAtLeast(1) ?: 1
+                    state.periodMax = v.coerceAtLeast(state.periodMin)
+                    // P2-9：若 max 被 coerce 修正，回写
+                    val maxText = state.periodMax.toString()
+                    if (etMax.text?.toString() != maxText) {
+                        etMax.setText(maxText)
+                        etMax.setSelection(maxText.length)
+                    }
+                } finally {
+                    syncing = false
+                }
+            }
+        })
+
+        row.addView(etMin)
+        row.addView(TextView(activity).apply { text = "圈   最大: "; textSize = 13f; setPadding(10, 0, 0, 0) })
+        row.addView(etMax)
         row.addView(TextView(activity).apply { text = "圈"; textSize = 13f; setPadding(10, 0, 0, 0) })
         return row
     }
+
+    // ==================== 规则行 ====================
 
     private fun buildRuleRow(
         state: StateNode,
@@ -266,7 +311,6 @@ class StateEditPageBuilder(
             textSize = 13f
         })
 
-        // 顺序跟随用户排序
         val allStateIds = config.states.keys.toList()
         if (allStateIds.isEmpty()) {
             targetRow.addView(TextView(activity).apply {

@@ -7,15 +7,9 @@ import java.io.File
 
 // 项目配置加载 / 保存 / 与磁盘同步。
 //
-// 持久化只存"用户配置"，不存解析缓存（ResourceItem.info 重新解析）。
-// 加载时与磁盘 GIF 列表同步：新增补建、缺失清理引用。
-// JSON 损坏返回 Corrupted，不静默覆盖磁盘。
-//
-// 【资源速度存储】只存 customValue 一个字段，语义由 playbackMode 决定：
-//   NATIVE          -> customValue 忽略
-//   FRAME_INTERVAL  -> customValue = 帧间隔（ms）
-//   TOTAL_DURATION  -> customValue = 总时长（ms）
-// 另一个时间参数不存储，由 ResourceItem 的方法从 customValue + frameCount 推导。
+// 【toJsonString】抽出序列化逻辑，供 save() 与"未修改检测"共用。
+// MainActivity 进入编辑页时记录快照，返回时与当前 config 的 toJsonString 比对，
+// 未变化则不弹保存确认框。
 object ProjectConfigStore {
 
     const val CONFIG_FILE = "project.json"
@@ -53,7 +47,6 @@ object ProjectConfigStore {
         return LoadResult.Ok(config)
     }
 
-    // 仅解析 JSON 文本，不写盘、不同步。用于导入前的格式验证。
     fun parseOnly(text: String): ProjectConfig? {
         if (text.isBlank()) return null
         return try {
@@ -90,7 +83,8 @@ object ProjectConfigStore {
             val anim = AnimationItem(
                 id = id,
                 name = obj.optString("name", id),
-                backgroundColor = obj.optString("backgroundColor", "")
+                backgroundColor = obj.optString("backgroundColor", ""),
+                endTimeMs = obj.optInt("endTimeMs", 0).coerceAtLeast(0)
             )
             val refsArr = obj.optJSONArray("resources") ?: JSONArray()
             for (j in 0 until refsArr.length()) {
@@ -105,7 +99,8 @@ object ProjectConfigStore {
                         scaleMode = parseScaleMode(refObj.optString("scaleMode", "PERCENT")),
                         scaleValue = refObj.optDouble("scaleValue", 100.0).toFloat(),
                         offsetX = refObj.optDouble("offsetX", 0.0).toFloat(),
-                        offsetY = refObj.optDouble("offsetY", 0.0).toFloat()
+                        offsetY = refObj.optDouble("offsetY", 0.0).toFloat(),
+                        startDelayMs = refObj.optInt("startDelayMs", 0).coerceAtLeast(0)
                     )
                 )
             }
@@ -146,10 +141,7 @@ object ProjectConfigStore {
             val type = parseEventType(obj.optString("type", "ORIENTATION"))
             val triggerParam = obj.optString("triggerParam", "")
 
-            // 旧版本方向规则（FORWARD / REVERSE）作废：直接丢弃
-            if (type == EventType.ORIENTATION && !isValidOrientationName(triggerParam)) {
-                continue
-            }
+            if (type == EventType.ORIENTATION && !isValidOrientationName(triggerParam)) continue
 
             val rule = EventRule(
                 id = obj.optString("id", "ev_$i"),
@@ -177,94 +169,104 @@ object ProjectConfigStore {
         return config
     }
 
+    // ==================== 序列化 ====================
+
+    // 抽出序列化逻辑，供 save() 与"未修改检测"共用。
+    // 格式固定（4 空格缩进），同一份配置两次调用结果完全一致，可做字符串比对。
+    fun toJsonString(config: ProjectConfig): String {
+        val json = JSONObject()
+        json.put("defaultStateId", config.defaultStateId)
+
+        val resArr = JSONArray()
+        for (r in config.resources.values) {
+            resArr.put(JSONObject().apply {
+                put("id", r.id)
+                put("fileName", r.fileName)
+                put("playbackMode", r.playbackMode.name)
+                put("customValue", r.customValue)
+            })
+        }
+        json.put("resources", resArr)
+
+        val animArr = JSONArray()
+        for (a in config.animations.values) {
+            val obj = JSONObject().apply {
+                put("id", a.id)
+                put("name", a.name)
+                put("backgroundColor", a.backgroundColor)
+                put("endTimeMs", a.endTimeMs)
+            }
+            val refs = JSONArray()
+            for (ref in a.resources) {
+                refs.put(JSONObject().apply {
+                    put("resourceId", ref.resourceId)
+                    put("anchor", ref.anchor.name)
+                    put("targetAnchor", ref.targetAnchor.name)
+                    put("scaleMode", ref.scaleMode.name)
+                    put("scaleValue", ref.scaleValue.toDouble())
+                    put("offsetX", ref.offsetX.toDouble())
+                    put("offsetY", ref.offsetY.toDouble())
+                    put("startDelayMs", ref.startDelayMs)
+                })
+            }
+            obj.put("resources", refs)
+            animArr.put(obj)
+        }
+        json.put("animations", animArr)
+
+        val stateArr = JSONArray()
+        for (s in config.states.values) {
+            val obj = JSONObject().apply {
+                put("id", s.id)
+                put("name", s.name)
+                put("animationId", s.animationId)
+                put("periodMin", s.periodMin)
+                put("periodMax", s.periodMax)
+            }
+            val rules = JSONArray()
+            for (r in s.rules) {
+                rules.put(JSONObject().apply {
+                    put("targetStateId", r.targetStateId)
+                    put("weight", r.weight)
+                })
+            }
+            obj.put("rules", rules)
+            stateArr.put(obj)
+        }
+        json.put("states", stateArr)
+
+        val evArr = JSONArray()
+        for (e in config.eventRules) {
+            val obj = JSONObject().apply {
+                put("id", e.id)
+                put("type", e.type.name)
+                put("triggerParam", e.triggerParam)
+                put("targetStateId", e.targetStateId)
+            }
+            val srcArr = JSONArray()
+            for (sid in e.sourceStateIds) srcArr.put(sid)
+            obj.put("sourceStateIds", srcArr)
+
+            val condArr = JSONArray()
+            for (c in e.conditions) {
+                condArr.put(JSONObject().apply {
+                    put("type", c.type.name)
+                    put("param", c.param)
+                })
+            }
+            obj.put("conditions", condArr)
+            evArr.put(obj)
+        }
+        json.put("eventRules", evArr)
+
+        return json.toString(4)
+    }
+
     // ==================== 保存 ====================
 
     fun save(context: Context, config: ProjectConfig): Boolean {
         return try {
-            val json = JSONObject()
-            json.put("defaultStateId", config.defaultStateId)
-
-            val resArr = JSONArray()
-            for (r in config.resources.values) {
-                resArr.put(JSONObject().apply {
-                    put("id", r.id)
-                    put("fileName", r.fileName)
-                    put("playbackMode", r.playbackMode.name)
-                    put("customValue", r.customValue)
-                })
-            }
-            json.put("resources", resArr)
-
-            val animArr = JSONArray()
-            for (a in config.animations.values) {
-                val obj = JSONObject().apply {
-                    put("id", a.id)
-                    put("name", a.name)
-                    put("backgroundColor", a.backgroundColor)
-                }
-                val refs = JSONArray()
-                for (ref in a.resources) {
-                    refs.put(JSONObject().apply {
-                        put("resourceId", ref.resourceId)
-                        put("anchor", ref.anchor.name)
-                        put("targetAnchor", ref.targetAnchor.name)
-                        put("scaleMode", ref.scaleMode.name)
-                        put("scaleValue", ref.scaleValue.toDouble())
-                        put("offsetX", ref.offsetX.toDouble())
-                        put("offsetY", ref.offsetY.toDouble())
-                    })
-                }
-                obj.put("resources", refs)
-                animArr.put(obj)
-            }
-            json.put("animations", animArr)
-
-            val stateArr = JSONArray()
-            for (s in config.states.values) {
-                val obj = JSONObject().apply {
-                    put("id", s.id)
-                    put("name", s.name)
-                    put("animationId", s.animationId)
-                    put("periodMin", s.periodMin)
-                    put("periodMax", s.periodMax)
-                }
-                val rules = JSONArray()
-                for (r in s.rules) {
-                    rules.put(JSONObject().apply {
-                        put("targetStateId", r.targetStateId)
-                        put("weight", r.weight)
-                    })
-                }
-                obj.put("rules", rules)
-                stateArr.put(obj)
-            }
-            json.put("states", stateArr)
-
-            val evArr = JSONArray()
-            for (e in config.eventRules) {
-                val obj = JSONObject().apply {
-                    put("id", e.id)
-                    put("type", e.type.name)
-                    put("triggerParam", e.triggerParam)
-                    put("targetStateId", e.targetStateId)
-                }
-                val srcArr = JSONArray()
-                for (sid in e.sourceStateIds) srcArr.put(sid)
-                obj.put("sourceStateIds", srcArr)
-
-                val condArr = JSONArray()
-                for (c in e.conditions) {
-                    condArr.put(JSONObject().apply {
-                        put("type", c.type.name)
-                        put("param", c.param)
-                    })
-                }
-                obj.put("conditions", condArr)
-                evArr.put(obj)
-            }
-            json.put("eventRules", evArr)
-
-            configFile(context).writeText(json.toString(4))
+            configFile(context).writeText(toJsonString(config))
             true
         } catch (e: Exception) {
             e.printStackTrace()
@@ -274,12 +276,6 @@ object ProjectConfigStore {
 
     // ==================== 与磁盘同步 ====================
 
-    // 用磁盘 GIF 列表刷新 resources：
-    //   1. 新增 GIF 补建 ResourceItem（并解析 info）
-    //   2. 缺失 GIF 移除 ResourceItem，清理引用它的 AnimationResourceRef
-    //   3. 清理悬空状态 / 事件规则引用
-    //   4. 校验 defaultStateId
-    //   5. 已有资源保留用户速度配置，仅更新 fileName / info
     private fun syncWithDisk(context: Context, config: ProjectConfig) {
         val dir = animDir(context)
         val files = dir.listFiles { f -> f.extension.lowercase() == "gif" } ?: emptyArray()
@@ -293,7 +289,6 @@ object ProjectConfigStore {
             val info = GifMetadataParser.parse(file)
             val existing = config.resources[id]
             if (existing != null) {
-                // 保留用户速度配置（playbackMode / customValue），只更新文件相关字段
                 config.resources[id] = existing.copy(fileName = file.name, info = info)
             } else {
                 config.resources[id] = ResourceItem(id, file.name, info)
@@ -336,7 +331,6 @@ object ProjectConfigStore {
     private fun parsePlaybackMode(name: String): ResourcePlaybackMode =
         runCatching { ResourcePlaybackMode.valueOf(name) }.getOrDefault(ResourcePlaybackMode.NATIVE)
 
-    // 校验方向名是否合法（用于丢弃旧 FORWARD/REVERSE 与非法值）
     private fun isValidOrientationName(name: String): Boolean {
         if (name.isEmpty()) return false
         return DeviceOrientation.values().any { it.name == name && it != DeviceOrientation.UNKNOWN }

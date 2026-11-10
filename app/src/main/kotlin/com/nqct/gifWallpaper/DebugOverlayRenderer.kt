@@ -7,8 +7,10 @@ import android.graphics.RectF
 import android.graphics.Typeface
 import java.util.Locale
 
-// 壁纸调试信息 / 错误信息的绘制器（无状态、无业务依赖）。
-// 显示文本（stateName / animationDisplay / infoMessage）由调用方传入已格式化的字符串。
+// 壁纸调试信息 / 错误信息绘制器。
+//
+// 【清理说明】原 frameIndexIsEstimate 字段在服务层始终传 false，
+// 已移除。调试面板固定显示精确帧索引。
 class DebugOverlayRenderer {
 
     data class DebugState(
@@ -24,7 +26,6 @@ class DebugOverlayRenderer {
         val frameIntervalMs: Long,
         val isAlarm: Boolean,
         val hasError: Boolean,
-        val frameIndexIsEstimate: Boolean = true,
         val animationDisplay: String = "",
         val postureText: String = "",
         val lastShakeText: String = "无",
@@ -35,8 +36,6 @@ class DebugOverlayRenderer {
         val isTouching: Boolean = false,
         val enterStateCount: Int = 0,
         val cycleTimerCount: Int = 0,
-        // 临时信息提示（如"正在重新加载动画"），非空时显示在面板顶部。
-        // 调用方负责在合适时间后清空（传空串）。
         val infoMessage: String = ""
     )
 
@@ -69,7 +68,6 @@ class DebugOverlayRenderer {
         typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
     }
 
-    // 绘制红字错误面板（画布中央偏上）。
     fun drawErrorInfo(canvas: Canvas, errorMsg: String) {
         if (errorMsg.isBlank()) return
 
@@ -102,14 +100,11 @@ class DebugOverlayRenderer {
         drawWrappedText(canvas, errorMsg, errorTextPaint, centerX, startY, maxWidth)
     }
 
-    // 绘制调试信息面板。
-    // infoMessage 非空时显示在最顶部一行（黄色高亮）。
     fun drawDebugInfo(canvas: Canvas, s: DebugState) {
         val warnSign = if (s.isAlarm) " [⚠ 超阈值]" else ""
 
-        val estimateMark = if (s.frameIndexIsEstimate) " (估算)" else ""
         val frameText = if (s.frameIndex >= 0 && s.frameCount > 0) {
-            " 第 ${s.frameIndex + 1}/${s.frameCount} 帧$estimateMark"
+            " 第 ${s.frameIndex + 1}/${s.frameCount} 帧"
         } else ""
 
         val sensorLine = buildString {
@@ -138,7 +133,6 @@ class DebugOverlayRenderer {
         val centerX = canvas.width / 2f
         val centerY = if (s.hasError) canvas.height / 2f * 1.4f else canvas.height / 2f
 
-        // 计算整体高度（含 infoMessage 行）
         var totalHeight = 0f
         val infoLines = if (s.infoMessage.isNotEmpty()) s.infoMessage.split("\n") else emptyList()
         for (line in infoLines) {
