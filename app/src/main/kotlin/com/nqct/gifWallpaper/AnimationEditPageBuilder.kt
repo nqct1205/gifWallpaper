@@ -9,6 +9,7 @@ import android.graphics.Typeface
 import android.os.Build
 import android.text.Editable
 import android.text.InputType
+import android.text.TextUtils
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -19,18 +20,26 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
+import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
+import java.util.IdentityHashMap
 
 // 动画编辑页。
 //
 // 【结束方式】
-//   多资源时提供两种结束方式（RadioGroup 二选一）：
+//   单/多资源均显示（资源非空时）：
 //     - 自动：单资源=资源自身播完；多资源=最后一个资源播完。endTimeMs = 0。
 //     - 自定义时长：持续 N 毫秒后结束，所有资源立即停止绘制。endTimeMs = N。
-//   单资源时隐藏整块（自动即资源自身时长）。
+//   默认自动。
+//
+// 【资源卡片】
+//   - 单资源：默认展开。
+//   - 多资源：默认折叠，仅显示 header（序号 + 资源名 + 拖动 handle + 移除）。
+//   - 点击 header 切换展开/折叠；展开状态按 ref 引用记录，排序后保持。
+//   - 拖动 handle 可排序，列表顺序即渲染顺序（drawFrame 按 instances 顺序绘制）。
 //
 // 【返回语义】"< 返回"按钮直接调 callbacks.onBack()。
 // 是否保存由 MainActivity 判断（未修改不弹窗）。
@@ -38,6 +47,7 @@ class AnimationEditPageBuilder(
     private val activity: Activity,
     private val config: ProjectConfig,
     private val animationId: String,
+    private val scrollView: ScrollView,
     private val callbacks: Callbacks
 ) {
 
@@ -48,6 +58,9 @@ class AnimationEditPageBuilder(
     }
 
     private enum class SelectorType { ANCHOR, TARGET }
+
+    // 折叠状态按 ref 引用记录（IdentityHashMap 避免 data class 字段变化影响 hash）。
+    private val expandedState = IdentityHashMap<AnimationResourceRef, Boolean>()
 
     fun build(): View {
         val animation = config.animations[animationId] ?: return View(activity)
@@ -77,12 +90,14 @@ class AnimationEditPageBuilder(
         root.addView(buildNameRow(animation), matchWrap(top = 10, bottom = 10))
         root.addView(buildBackgroundColorSection(animation), matchWrap(bottom = 10))
 
-        // 多资源：结束方式 + 提示
-        if (animation.resources.size > 1) {
+        // 结束方式：单/多资源均显示（资源非空时），默认自动
+        if (animation.resources.isNotEmpty()) {
             root.addView(buildEndTimeSection(animation), matchWrap(bottom = 10))
+        }
+        if (animation.resources.size > 1) {
             root.addView(TextView(activity).apply {
                 text = "当前动画引用了 ${animation.resources.size} 个资源。" +
-                    "每个资源可设置独立的启动延迟。"
+                    "每个资源可设置独立的启动延迟；拖动卡片可调整渲染顺序。"
                 textSize = 12f
                 setTextColor(Color.parseColor("#2196F3"))
                 setPadding(0, 0, 0, 10)
@@ -92,22 +107,46 @@ class AnimationEditPageBuilder(
         val refContainer = LinearLayout(activity).apply { orientation = LinearLayout.VERTICAL }
         root.addView(refContainer)
 
+        val emptyHint = TextView(activity).apply {
+            text = "尚未添加资源引用"
+            textSize = 13f
+            setTextColor(Color.GRAY)
+            setPadding(20, 20, 20, 20)
+        }
+        val reorderable = ReorderableColumn(activity)
+        refContainer.addView(emptyHint, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+        refContainer.addView(reorderable, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        ))
+
         fun refreshAll() {
-            refContainer.removeAllViews()
             if (animation.resources.isEmpty()) {
-                refContainer.addView(TextView(activity).apply {
-                    text = "尚未添加资源引用"
-                    textSize = 13f
-                    setTextColor(Color.GRAY)
-                    setPadding(20, 20, 20, 20)
-                })
+                emptyHint.visibility = View.VISIBLE
+                reorderable.visibility = View.GONE
             } else {
-                animation.resources.forEachIndexed { idx, ref ->
-                    refContainer.addView(
-                        buildRefCard(animation, idx, ref, ::refreshAll),
-                        matchWrap(bottom = 10)
-                    )
-                }
+                emptyHint.visibility = View.GONE
+                reorderable.visibility = View.VISIBLE
+                reorderable.setItems(
+                    items = animation.resources.toList(),
+                    scrollView = scrollView,
+                    itemBuilder = { ref, idx, handle ->
+                        buildRefCard(animation, idx, ref, handle, ::refreshAll)
+                    },
+                    onReorder = { from, to ->
+                        if (from != to &&
+                            from in animation.resources.indices &&
+                            to in animation.resources.indices
+                        ) {
+                            val item = animation.resources.removeAt(from)
+                            animation.resources.add(to, item)
+                            refreshAll()
+                        }
+                    }
+                )
             }
         }
         refreshAll()
@@ -128,6 +167,18 @@ class AnimationEditPageBuilder(
         root.addView(buildBottomBar())
 
         return root
+    }
+
+    // ==================== 折叠状态 ====================
+
+    private fun isExpanded(animation: AnimationItem, ref: AnimationResourceRef): Boolean {
+        val saved = expandedState[ref]
+        if (saved != null) return saved
+        return animation.resources.size <= 1
+    }
+
+    private fun setExpanded(ref: AnimationResourceRef, expanded: Boolean) {
+        expandedState[ref] = expanded
     }
 
     // ==================== 结束方式 ====================
@@ -446,6 +497,7 @@ class AnimationEditPageBuilder(
         animation: AnimationItem,
         index: Int,
         ref: AnimationResourceRef,
+        handle: View,
         refreshAll: () -> Unit
     ): View {
         val ids = config.resources.keys.toList()
@@ -453,37 +505,68 @@ class AnimationEditPageBuilder(
             ref.resourceId = ids.first()
         }
 
+        var expanded = isExpanded(animation, ref)
+
         val card = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(20, 20, 20, 20)
             setBackgroundColor(Color.WHITE)
         }
 
+        val content = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = if (expanded) View.VISIBLE else View.GONE
+        }
+
         val header = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        header.addView(TextView(activity).apply {
-            text = "资源引用 #${index + 1}"
+
+        val expandIndicator = TextView(activity).apply {
+            text = if (expanded) "▼" else "▶"
+            textSize = 14f
+            setPadding(0, 0, 10, 0)
+        }
+        header.addView(expandIndicator)
+
+        val titleView = TextView(activity).apply {
+            text = "资源引用 #${index + 1}：${ref.resourceId}"
             textSize = 15f
             setTypeface(null, Typeface.BOLD)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        })
+        }
+        header.addView(titleView)
+
+        header.addView(handle)
+
         header.addView(Button(activity).apply {
             text = "移除"
             setTextColor(Color.RED)
             setOnClickListener {
                 animation.resources.remove(ref)
+                expandedState.remove(ref)
                 refreshAll()
             }
         })
-        card.addView(header)
 
-        card.addView(buildResourceSelector(ref, refreshAll), matchWrap(top = 5))
+        header.setOnClickListener {
+            expanded = !expanded
+            setExpanded(ref, expanded)
+            content.visibility = if (expanded) View.VISIBLE else View.GONE
+            expandIndicator.text = if (expanded) "▼" else "▶"
+        }
+
+        card.addView(header)
+        card.addView(content)
+
+        content.addView(buildResourceSelector(ref, refreshAll), matchWrap(top = 5))
 
         val resource = config.resources[ref.resourceId]
         val info = resource?.info
-        card.addView(TextView(activity).apply {
+        content.addView(TextView(activity).apply {
             text = if (info != null) {
                 "原尺寸: ${info.width}x${info.height}  |  ${info.frameCount} 帧  |  ${info.totalDelayMs / 1000f} 秒"
             } else {
@@ -494,46 +577,46 @@ class AnimationEditPageBuilder(
             setPadding(0, 5, 0, 5)
         })
 
-        card.addView(buildQuickAlignRow(ref, refreshAll), matchWrap(top = 5, bottom = 5))
+        content.addView(buildQuickAlignRow(ref, refreshAll), matchWrap(top = 5, bottom = 5))
 
-        card.addView(TextView(activity).apply {
+        content.addView(TextView(activity).apply {
             text = "GIF 锚点（缩放/对齐中心）"
             textSize = 13f
             setPadding(0, 10, 0, 5)
         })
-        card.addView(buildAnchorSelector(ref, SelectorType.ANCHOR))
+        content.addView(buildAnchorSelector(ref, SelectorType.ANCHOR))
 
-        card.addView(TextView(activity).apply {
+        content.addView(TextView(activity).apply {
             text = "屏幕目标锚点（对齐位置）"
             textSize = 13f
             setPadding(0, 10, 0, 5)
         })
-        card.addView(buildAnchorSelector(ref, SelectorType.TARGET))
+        content.addView(buildAnchorSelector(ref, SelectorType.TARGET))
 
-        card.addView(TextView(activity).apply {
+        content.addView(TextView(activity).apply {
             text = "缩放"
             textSize = 13f
             setPadding(0, 10, 0, 5)
         })
-        card.addView(buildScaleRow(ref, info))
+        content.addView(buildScaleRow(ref, info))
 
-        card.addView(TextView(activity).apply {
+        content.addView(TextView(activity).apply {
             text = "额外偏移（像素，正向右 / 下）"
             textSize = 13f
             setPadding(0, 10, 0, 5)
         })
-        card.addView(buildOffsetRow(ref))
+        content.addView(buildOffsetRow(ref))
 
         // 多资源时显示启动延迟
         if (animation.resources.size > 1) {
-            card.addView(TextView(activity).apply {
+            content.addView(TextView(activity).apply {
                 text = "播放时间"
                 textSize = 13f
                 setTypeface(null, Typeface.BOLD)
                 setPadding(0, 15, 0, 5)
             })
-            card.addView(buildStartDelayRow(ref))
-            card.addView(TextView(activity).apply {
+            content.addView(buildStartDelayRow(ref))
+            content.addView(TextView(activity).apply {
                 text = "说明：从动画开始后延迟 ${ref.startDelayMs}ms 再播放本资源。"
                 textSize = 11f
                 setTextColor(Color.GRAY)

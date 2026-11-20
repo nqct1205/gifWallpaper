@@ -31,7 +31,7 @@ object GifMetadataParser {
                 parseStream(input, file.length())
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            LogBuffer.e("GIF 元数据解析失败: ${file.name}", e)
             null
         }
     }

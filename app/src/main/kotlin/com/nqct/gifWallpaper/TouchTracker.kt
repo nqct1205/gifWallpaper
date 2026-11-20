@@ -6,7 +6,6 @@ import android.view.MotionEvent
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import kotlin.math.abs
 
 // 触摸状态快照。
 //

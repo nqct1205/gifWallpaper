@@ -17,6 +17,15 @@ import java.util.Locale
 //
 // 【线程】所有方法内部 synchronized 保护缓冲，跨线程安全。
 // 【logcat】所有类别同步打到 logcat，TAG 统一 "GifWP"，性能日志带 [PERF] 前缀。
+//
+// 【调用约定】
+//   - 失败事件（异常、解码/加载/保存/导入导出失败）用 e(msg, throwable)。
+//   - 可恢复的降级/退避/重试（加载失败退避、兜底周期流转）用 w(msg)。
+//   - 关键流程节点（生命周期、状态切换、用户操作）用 i(msg)。
+//   - 性能指标（帧耗时、内存、卡顿、耗时超限）用 perf(msg)，
+//     消息应含：指标名 + 当前值 + 阈值 + 相关上下文。
+//   - 消息中尽量带可过滤的上下文键值对：state=xxx anim=xxx resource=xxx gen=xxx。
+//   - 禁止 printStackTrace；统一走 LogBuffer.e。
 object LogBuffer {
 
     private const val MAX_GENERAL = 2000

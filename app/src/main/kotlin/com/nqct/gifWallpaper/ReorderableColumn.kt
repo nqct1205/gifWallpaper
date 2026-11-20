@@ -12,9 +12,9 @@ import android.widget.TextView
 
 // 可拖动排序的纵向列表。
 //
-// 【边界限制（本轮新增）】
-//   - 被拖项在视觉上不能超出第一个/最后一个 item 的中心位置。
-//   - 拖到顶端时向上不再移动，拖到底端时向下不再移动。
+// 【边界限制】
+//   - 被拖项中心可越过首/末 item 中心，最多再超出自身高度，
+//     避免拖到顶部/底部时视觉上"卡住"。
 //   - 自动滚动到 ScrollView 顶/底后自动停止，不再无限累积偏移。
 //
 // 【P1-2 修复】itemTops/itemHeights 在 startDrag 时重新采集。
@@ -166,14 +166,16 @@ class ReorderableColumn @JvmOverloads constructor(
         }
     }
 
-    // 计算 dy 上下边界：被拖项中心不能越出第一个/最后一个 item 的中心。
+    // 计算 dy 上下边界：被拖项中心可越过首/末 item 中心，最多再超出自身高度。
+    // 这样拖到顶部/底部时仍有跟手位移，不会视觉上"卡住"。
     private fun computeDyBounds(): Pair<Float, Float> {
         if (dragIndex !in itemViews.indices) return -Float.MAX_VALUE to Float.MAX_VALUE
         val dragCenter = itemTops[dragIndex] + itemHeights[dragIndex] / 2f
         val topCenter = itemTops[0] + itemHeights[0] / 2f
         val last = itemViews.size - 1
         val bottomCenter = itemTops[last] + itemHeights[last] / 2f
-        return (topCenter - dragCenter) to (bottomCenter - dragCenter)
+        val overshoot = itemHeights[dragIndex].toFloat()
+        return (topCenter - dragCenter - overshoot) to (bottomCenter - dragCenter + overshoot)
     }
 
     private fun updateDrag(rawY: Float) {

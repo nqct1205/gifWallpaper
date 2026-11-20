@@ -112,8 +112,8 @@ class PlayInstance(
 // 一个动画的运行时。
 //
 // 【整圈时长优先用用户配置的 endTimeMs】
-//   configuredEndTimeMs > 0 且资源数 > 1 → 用 endTimeMs（用户自定义）
-//   否则                                 → autoTotalDurationMs = max(所有资源.endMs)
+//   configuredEndTimeMs > 0 → 用 endTimeMs（用户自定义，单/多资源均支持）
+//   否则                    → autoTotalDurationMs = max(所有资源.endMs)
 //
 // 用户自定义 endTimeMs 时，某些资源可能被截断（endMs > endTimeMs），
 // 也可能出现空窗（endMs < endTimeMs）。两种情况都是预期行为。
@@ -123,7 +123,7 @@ class AnimRuntime(
     configuredEndTimeMs: Long = 0L
 ) {
     private val userEndTimeMs: Long =
-        if (instances.size > 1 && configuredEndTimeMs > 0) configuredEndTimeMs else 0L
+        if (configuredEndTimeMs > 0) configuredEndTimeMs else 0L
 
     // 自动整圈时长 = 最晚结束的资源。
     val autoTotalDurationMs: Long

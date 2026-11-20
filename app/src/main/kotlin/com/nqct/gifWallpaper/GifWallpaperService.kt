@@ -1,12 +1,10 @@
 package com.nqct.gifWallpaper
 
-import android.app.ActivityManager
 import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.RectF
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -19,7 +17,6 @@ import android.os.SystemClock
 import android.service.wallpaper.WallpaperService
 import android.view.MotionEvent
 import android.view.SurfaceHolder
-import java.io.File
 
 // GIF 状态机动态壁纸服务。
 //
@@ -44,6 +41,7 @@ import java.io.File
 // 【加载失败退避】P2-5
 //   同一 animId 连续失败 LOAD_FAILURE_MAX 次后，在 LOAD_FAILURE_COOLDOWN_MS 内
 //   不再重试，直接用兜底周期流转。避免坏文件导致每次进入都全量解码。
+//   （加载/重载/退避已抽到 RuntimeLoader，本类通过 loadCallbacks 接收结果。）
 class GifWallpaperService : WallpaperService() {
 
     @Volatile private var currentEngine: GifEngine? = null
@@ -61,15 +59,7 @@ class GifWallpaperService : WallpaperService() {
 
         // 零时长 / 空 runtime 的兜底周期（毫秒）
         const val FALLBACK_CYCLE_MS = 1000L
-
-        // 加载失败退避：连续失败达到次数后进入冷却
-        const val LOAD_FAILURE_MAX = 3
-        const val LOAD_FAILURE_COOLDOWN_MS = 60_000L
     }
-
-    // 加载失败退避记录。
-    // 放在 GifEngine 外部，因为 Kotlin 的 inner class 内部不允许声明嵌套类/数据类。
-    private data class LoadFailureRecord(var count: Int, var lastAttemptMs: Long)
 
     inner class GifEngine : Engine(), SharedPreferences.OnSharedPreferenceChangeListener,
         SensorEventListener {
@@ -89,17 +79,114 @@ class GifWallpaperService : WallpaperService() {
         private var currentRenderStateId: String = ""
         private var stateEnterTimeMs: Long = 0L
 
-        // 重载状态
-        private var pendingReloadAnimId: String? = null
-        private var pendingReloadStateId: String? = null
-        private var pendingReloadGen = 0
-        private var pendingReloadThread: Thread? = null
-
-        // 加载失败退避记录（LoadFailureRecord 定义在外层 GifWallpaperService 类体）
-        private val loadFailures = mutableMapOf<String, LoadFailureRecord>()
-
-        private var loaderThread: Thread? = null
         private var prefs: SharedPreferences? = null
+
+        // 后台加载 / 重载 / 失败退避。结果通过 loadCallbacks 回到本 Engine。
+        private val runtimeLoader by lazy {
+            RuntimeLoader(
+                configProvider = { ProjectConfigStore.load(this@GifWallpaperService) },
+                animDirProvider = { ProjectConfigStore.animDir(this@GifWallpaperService) }
+            )
+        }
+
+        private val loadCallbacks = object : RuntimeLoader.Callbacks {
+            override fun onLoadStart(gen: Int) {
+                LogBuffer.i("开始加载配置 gen=$gen")
+            }
+
+            override fun onLoadSuccess(
+                gen: Int,
+                cfg: ProjectConfig,
+                cache: Map<String, AnimRuntime>,
+                errorMsg: String
+            ) {
+                if (destroyed) return
+                releaseAllRuntimes()
+                animRuntimeCache.putAll(cache)
+                runtimeLoader.clearFailures()
+
+                config = cfg
+                configErrorMsg = errorMsg
+                stateErrorMsg = ""
+                readGlobalPrefs()
+                forceShowDebug = false
+                engineStartTime = SystemClock.elapsedRealtime()
+
+                playback.reset()
+                enterState(playback.currentStateId(), "加载完成")
+
+                ready = true
+                registerSensorsIfNeeded()
+                if (visible) {
+                    handler.removeCallbacks(drawRunnable)
+                    lastFrameTime = 0L
+                    handler.post(drawRunnable)
+                }
+                LogBuffer.i("加载完成 gen=$gen: ${cfg.states.size} 状态, ${cfg.animations.size} 动画")
+            }
+
+            override fun onLoadFailure(gen: Int, message: String) {
+                if (destroyed) return
+                configErrorMsg = message
+                ready = true
+                if (visible) {
+                    handler.removeCallbacks(drawRunnable)
+                    lastFrameTime = 0L
+                    handler.post(drawRunnable)
+                }
+            }
+
+            override fun onReloadStart(animId: String, stateId: String) {
+                setInfoMessage("⟳ 正在重新加载动画: $animId", 5000L)
+                LogBuffer.w("动画被系统释放，开始异步重载: $animId")
+            }
+
+            override fun onReloadSkipped(animId: String) {
+                LogBuffer.d("已有相同动画在重载中: $animId")
+            }
+
+            override fun onReloadSuccess(
+                animId: String,
+                stateId: String,
+                runtime: AnimRuntime,
+                costMs: Long
+            ) {
+                if (destroyed) return
+                animRuntimeCache[animId] = runtime
+                LogBuffer.i("动画重新加载完成: $animId (${runtime.allocationBytes / 1024 / 1024}MB, 耗时 ${costMs}ms)")
+                if (costMs > 100) {
+                    LogBuffer.perf("重载耗时较长 ${costMs}ms: $animId")
+                }
+
+                if (currentRenderStateId == stateId) {
+                    currentRuntime = runtime
+                    stateErrorMsg = ""
+                    setInfoMessage("✓ 已重新加载: $animId", 5000L)
+                    runtime.reset()
+                    stateEnterTimeMs = SystemClock.elapsedRealtime()
+                    runtime.syncPlayback(0L)
+                    lastFrameTime = 0L
+                    scheduleCycleTimer()
+                } else {
+                    setInfoMessage("✓ 已重新加载: $animId（当前已切走）", 3000L)
+                }
+            }
+
+            override fun onReloadFailure(
+                animId: String,
+                stateId: String,
+                costMs: Long,
+                failCount: Int
+            ) {
+                if (destroyed) return
+                setInfoMessage("✗ 重新加载失败: $animId", 8000L)
+                LogBuffer.e("动画重新加载失败: $animId (耗时 ${costMs}ms, 失败次数=$failCount)")
+                stateErrorMsg = "动画重新加载失败: $animId"
+                stateEnterTimeMs = SystemClock.elapsedRealtime()
+                lastFrameTime = 0L
+                scheduleCycleTimer()
+            }
+        }
 
         private var cycleTimerRunnable: Runnable? = null
         private var pendingCycleSwitch = false
@@ -150,9 +237,6 @@ class GifWallpaperService : WallpaperService() {
         private val debugRenderer = DebugOverlayRenderer()
         private val memInfo = Debug.MemoryInfo()
 
-        @Volatile private var loadGeneration = 0
-        private val LOW_MEM_AVAIL_MB = 150L
-
         // ==================== 渲染循环 ====================
 
         private val drawRunnable = object : Runnable {
@@ -190,9 +274,7 @@ class GifWallpaperService : WallpaperService() {
             unregisterSensors()
             cancelCycleTimer()
             // P2-6：onDestroy 也要中断加载线程，递增 generation 使旧回调失效
-            loaderThread?.interrupt()
-            loaderThread = null
-            loadGeneration++
+            runtimeLoader.cancelAll()
             releaseAllRuntimes()
         }
 
@@ -257,98 +339,7 @@ class GifWallpaperService : WallpaperService() {
         // ==================== 后台加载 ====================
 
         private fun loadInBackground() {
-            val gen = ++loadGeneration
-            loaderThread?.interrupt()
-            loaderThread = Thread {
-                try {
-                    LogBuffer.i("开始加载配置")
-                    var cfg = ProjectConfig()
-                    var cfgMsg: String? = null
-                    when (val r = ProjectConfigStore.load(this@GifWallpaperService)) {
-                        is ProjectConfigStore.LoadResult.Ok -> cfg = r.config
-                        is ProjectConfigStore.LoadResult.Corrupted -> {
-                            cfgMsg = "配置损坏: ${r.message}\n(未应用，等待用户处理)"
-                            LogBuffer.e("配置损坏: ${r.message}")
-                        }
-                    }
-
-                    val dir = ProjectConfigStore.animDir(this@GifWallpaperService)
-                    val newCache = mutableMapOf<String, AnimRuntime>()
-                    val sb = StringBuilder()
-                    if (cfgMsg != null) sb.append(cfgMsg).append("\n")
-                    if (cfg.states.isEmpty()) sb.append("状态为空\n")
-
-                    for ((animId, anim) in cfg.animations) {
-                        if (gen != loadGeneration) return@Thread
-                        if (Thread.currentThread().isInterrupted) return@Thread
-                        val instances = mutableListOf<PlayInstance>()
-                        for (ref in anim.resources) {
-                            val resource = cfg.resources[ref.resourceId] ?: continue
-                            val file = File(dir, resource.fileName)
-                            val inst = PlayInstance.fromFile(resource.id, ref, file, resource)
-                            if (inst.gifDrawable == null) {
-                                sb.append("解码失败: ${resource.id}\n")
-                                LogBuffer.e("解码失败: ${resource.id}")
-                            }
-                            instances.add(inst)
-                        }
-                        if (instances.isNotEmpty()) {
-                            // 新需求2：传入用户配置的 endTimeMs（0=自动）
-                            val runtime = AnimRuntime(animId, instances, anim.endTimeMs.toLong())
-                            newCache[animId] = runtime
-                            val delayInfo = instances.joinToString(", ") {
-                                "${it.ref.resourceId}(delay=${it.getStartDelayMs()}ms, dur=${it.getTotalDurationMs()}ms)"
-                            }
-                            LogBuffer.i(
-                                "动画 $animId 预加载 ${instances.size} 个实例, " +
-                                    "整圈=${runtime.totalDurationMs}ms(用户配置=${runtime.isUsingUserEndTime}), " +
-                                    "内存约 ${runtime.allocationBytes / 1024 / 1024}MB, [$delayInfo]"
-                            )
-                        }
-                    }
-
-                    if (gen != loadGeneration) return@Thread
-
-                    handler.post {
-                        if (destroyed || gen != loadGeneration) return@post
-                        releaseAllRuntimes()
-                        animRuntimeCache.putAll(newCache)
-                        loadFailures.clear()  // 新配置加载成功，清空旧失败记录
-
-                        config = cfg
-                        configErrorMsg = sb.toString()
-                        stateErrorMsg = ""
-                        readGlobalPrefs()
-                        forceShowDebug = false
-                        engineStartTime = SystemClock.elapsedRealtime()
-
-                        playback.reset()
-                        enterState(playback.currentStateId(), "加载完成")
-
-                        ready = true
-                        registerSensorsIfNeeded()
-                        if (visible) {
-                            handler.removeCallbacks(drawRunnable)
-                            lastFrameTime = 0L
-                            handler.post(drawRunnable)
-                        }
-                        LogBuffer.i("加载完成: ${cfg.states.size} 状态, ${cfg.animations.size} 动画")
-                    }
-                } catch (e: Exception) {
-                    if (gen != loadGeneration) return@Thread
-                    LogBuffer.e("加载异常", e)
-                    handler.post {
-                        if (destroyed || gen != loadGeneration) return@post
-                        configErrorMsg = "加载异常:\n${e.message}"
-                        ready = true
-                        if (visible) {
-                            handler.removeCallbacks(drawRunnable)
-                            lastFrameTime = 0L
-                            handler.post(drawRunnable)
-                        }
-                    }
-                }
-            }.also { it.start() }
+            runtimeLoader.load(loadCallbacks)
         }
 
         private fun releaseAllRuntimes() {
@@ -360,11 +351,7 @@ class GifWallpaperService : WallpaperService() {
             animRuntimeCache.clear()
             currentRuntime = null
             // P2-4：递增 gen + 中断重载线程，防旧回调写入缓存
-            pendingReloadGen++
-            pendingReloadThread?.interrupt()
-            pendingReloadThread = null
-            pendingReloadAnimId = null
-            pendingReloadStateId = null
+            runtimeLoader.cancelPendingReload()
             if (totalBytes > 0) {
                 LogBuffer.i("释放全部运行时实例: ${totalBytes / 1024 / 1024}MB")
             }
@@ -372,7 +359,7 @@ class GifWallpaperService : WallpaperService() {
 
         private fun releaseNonCurrentRuntimes() {
             val keepAnimId = config.states[currentRenderStateId]?.animationId ?: ""
-            val pending = pendingReloadAnimId
+            val pending = runtimeLoader.pendingReloadAnimId()
             val toRemove = animRuntimeCache.keys.filter { it != keepAnimId && it != pending }
             for (id in toRemove) {
                 animRuntimeCache.remove(id)?.recycle()
@@ -401,11 +388,9 @@ class GifWallpaperService : WallpaperService() {
                 stateErrorMsg = ""  // 清状态错误，但 configErrorMsg 保留（P2-7）
 
                 // P2-5：加载失败退避检查
-                val rec = loadFailures[animId]
-                val now = SystemClock.elapsedRealtime()
-                if (rec != null && rec.count >= LOAD_FAILURE_MAX &&
-                    now - rec.lastAttemptMs < LOAD_FAILURE_COOLDOWN_MS) {
-                    val remainSec = (LOAD_FAILURE_COOLDOWN_MS - (now - rec.lastAttemptMs)) / 1000
+                val remainMs = runtimeLoader.backoffRemainingMs(animId)
+                if (remainMs > 0) {
+                    val remainSec = remainMs / 1000
                     stateErrorMsg = "动画 $animId 加载失败过多，${remainSec}s 内不再重试"
                     LogBuffer.w("状态 $stateId 引用 $animId 退避中，兜底周期流转")
                     // 兜底：scheduleCycleTimer 会用 FALLBACK_CYCLE_MS
@@ -415,7 +400,7 @@ class GifWallpaperService : WallpaperService() {
                     return
                 }
 
-                startReloadAnimation(animId, stateId)
+                runtimeLoader.reload(config, animId, stateId, loadCallbacks)
                 if (prevId != stateId) {
                     LogBuffer.i("状态切换: ${prevId.ifEmpty { "(初始)" }} -> $stateId ($reason)，动画缺失需重载")
                 }
@@ -441,83 +426,6 @@ class GifWallpaperService : WallpaperService() {
             if (cost > 50) {
                 LogBuffer.perf("状态切换耗时 ${cost}ms: ${prevId.ifEmpty { "(初始)" }} -> $stateId")
             }
-        }
-
-        private fun startReloadAnimation(animId: String, stateId: String) {
-            if (pendingReloadAnimId == animId) {
-                LogBuffer.d("已有相同动画在重载中: $animId")
-                return
-            }
-            pendingReloadAnimId = animId
-            pendingReloadStateId = stateId
-            val gen = ++pendingReloadGen
-            val startMs = SystemClock.elapsedRealtime()
-
-            setInfoMessage("⟳ 正在重新加载动画: $animId", 5000L)
-            LogBuffer.w("动画被系统释放，开始异步重载: $animId")
-
-            // P2-4：保存线程引用，onDestroy/releaseAllRuntimes 时可中断
-            pendingReloadThread = Thread {
-                val anim = config.animations[animId]
-                val instances = mutableListOf<PlayInstance>()
-                if (anim != null) {
-                    val dir = ProjectConfigStore.animDir(this@GifWallpaperService)
-                    for (ref in anim.resources) {
-                        if (Thread.currentThread().isInterrupted) return@Thread
-                        val resource = config.resources[ref.resourceId] ?: continue
-                        val file = File(dir, resource.fileName)
-                        val inst = PlayInstance.fromFile(resource.id, ref, file, resource)
-                        instances.add(inst)
-                    }
-                }
-                handler.post {
-                    if (destroyed || gen != pendingReloadGen) return@post
-                    pendingReloadAnimId = null
-                    pendingReloadStateId = null
-                    pendingReloadThread = null
-                    val cost = SystemClock.elapsedRealtime() - startMs
-
-                    val ok = instances.isNotEmpty() && instances.any { it.gifDrawable != null }
-                    if (!ok) {
-                        // P2-5：记录失败
-                        val prev = loadFailures[animId]
-                        loadFailures[animId] = LoadFailureRecord(
-                            count = (prev?.count ?: 0) + 1,
-                            lastAttemptMs = SystemClock.elapsedRealtime()
-                        )
-                        val newCount = loadFailures[animId]!!.count
-                        setInfoMessage("✗ 重新加载失败: $animId", 8000L)
-                        LogBuffer.e("动画重新加载失败: $animId (耗时 ${cost}ms, 失败次数=$newCount)")
-                        stateErrorMsg = "动画重新加载失败: $animId"
-                        // 兜底：让状态机继续流转
-                        stateEnterTimeMs = SystemClock.elapsedRealtime()
-                        lastFrameTime = 0L
-                        scheduleCycleTimer()
-                        return@post
-                    }
-
-                    val runtime = AnimRuntime(animId, instances, anim?.endTimeMs?.toLong() ?: 0L)
-                    animRuntimeCache[animId] = runtime
-                    loadFailures.remove(animId)  // 成功则清除失败记录
-                    LogBuffer.i("动画重新加载完成: $animId (${runtime.allocationBytes / 1024 / 1024}MB, 耗时 ${cost}ms)")
-                    if (cost > 100) {
-                        LogBuffer.perf("重载耗时较长 ${cost}ms: $animId")
-                    }
-
-                    if (currentRenderStateId == stateId) {
-                        currentRuntime = runtime
-                        stateErrorMsg = ""
-                        setInfoMessage("✓ 已重新加载: $animId", 5000L)
-                        runtime.reset()
-                        stateEnterTimeMs = SystemClock.elapsedRealtime()
-                        runtime.syncPlayback(0L)
-                        lastFrameTime = 0L
-                        scheduleCycleTimer()
-                    } else {
-                        setInfoMessage("✓ 已重新加载: $animId（当前已切走）", 3000L)
-                    }
-                }
-            }.also { it.start() }
         }
 
         private fun setInfoMessage(msg: String, durationMs: Long) {
@@ -696,9 +604,7 @@ class GifWallpaperService : WallpaperService() {
             ready = false
             handler.removeCallbacks(drawRunnable)
             cancelCycleTimer()
-            loaderThread?.interrupt()
-            loaderThread = null
-            loadGeneration++
+            runtimeLoader.cancelAll()
             unregisterSensors()
             releaseAllRuntimes()
         }
@@ -762,7 +668,7 @@ class GifWallpaperService : WallpaperService() {
                 // P3-11：先铺不透明黑底，再叠用户背景色。
                 // 避免半透明背景用 SRC_OVER 叠在上帧内容上造成残留。
                 canvas.drawColor(Color.BLACK)
-                val bgColor = resolveCurrentBackgroundColor()
+                val bgColor = RenderGeometry.resolveBackgroundColor(config, currentRenderStateId)
                 if (bgColor != Color.BLACK) {
                     canvas.drawColor(bgColor)
                 }
@@ -778,7 +684,7 @@ class GifWallpaperService : WallpaperService() {
                     for (inst in rt.instances) {
                         if (!inst.shouldDraw(elapsedMs)) continue
                         val info = inst.info ?: continue
-                        val bounds = computeBounds(inst.ref, info, screenW, screenH)
+                        val bounds = RenderGeometry.computeBounds(inst.ref, info, screenW, screenH)
                         inst.setBounds(
                             bounds.left.toInt(), bounds.top.toInt(),
                             bounds.right.toInt(), bounds.bottom.toInt()
@@ -851,7 +757,7 @@ class GifWallpaperService : WallpaperService() {
                 return currentRuntime?.frameIntervalMs()?.coerceIn(8L, 200L)
                     ?: (FALLBACK_CYCLE_MS / 4).coerceIn(8L, 200L)
             } catch (e: Exception) {
-                LogBuffer.e("drawFrame 异常", e)
+                LogBuffer.e("drawFrame 异常 state=$currentRenderStateId", e)
                 return 33L
             } finally {
                 if (canvas != null) {
@@ -881,36 +787,6 @@ class GifWallpaperService : WallpaperService() {
                     append(stateErrorMsg)
                 }
             }
-        }
-
-        private fun resolveCurrentBackgroundColor(): Int {
-            val animId = config.states[currentRenderStateId]?.animationId ?: return Color.BLACK
-            val anim = config.animations[animId] ?: return Color.BLACK
-            return parseColorSafe(anim.backgroundColor) ?: Color.BLACK
-        }
-
-        private fun computeBounds(
-            ref: AnimationResourceRef, info: GifInfo, screenW: Int, screenH: Int
-        ): RectF {
-            val origW = info.width.toFloat().coerceAtLeast(1f)
-            val origH = info.height.toFloat().coerceAtLeast(1f)
-            val (scaledW, scaledH) = when (ref.scaleMode) {
-                ScaleMode.PERCENT -> {
-                    val s = (ref.scaleValue / 100f).coerceAtLeast(0.01f)
-                    origW * s to origH * s
-                }
-                ScaleMode.PIXEL -> {
-                    val targetW = ref.scaleValue.coerceAtLeast(1f)
-                    targetW to origH * (targetW / origW)
-                }
-            }
-            val (ax, ay) = ref.anchor.normalized()
-            val (tx, ty) = ref.targetAnchor.normalized()
-            val targetX = screenW * tx + ref.offsetX
-            val targetY = screenH * ty + ref.offsetY
-            val left = targetX - scaledW * ax
-            val top = targetY - scaledH * ay
-            return RectF(left, top, left + scaledW, top + scaledH)
         }
 
         private fun buildDebugState(now: Long, isAlarm: Boolean): DebugOverlayRenderer.DebugState {
